@@ -26,7 +26,7 @@ except ImportError:
     sys.exit(1)
 
 # ──────────────────────────── config ────────────────────────────
-VERSION           = "2.4.0"
+VERSION           = "2.5.0"
 CONFIG_DIR        = Path.home() / ".repo-freshness-checker"
 TOKEN_FILE        = CONFIG_DIR / "token"
 API_BASE          = "https://api.github.com"
@@ -770,318 +770,457 @@ def generate_report(results: list[dict], errors: list[dict], path: str):
 
 # ──────────────────── HTML report ──────────────────────────────
 def generate_html_report(results: list[dict], errors: list[dict], path: str):
-    """Generate a standalone HTML report with filtering and sorting (vanilla JS)."""
+    """Generate a standalone HTML report (one self-contained file, vanilla JS).
+
+    Row data is embedded once as JSON and rendered client-side into a
+    sortable table with live search and status filter chips. Numeric sort
+    keys travel with each row (no display-string parsing) and each render
+    is a single batched innerHTML write, so lists of several thousand
+    repositories stay responsive. Keyboard: '/' focuses search, 'Esc'
+    clears it. No external assets, no network requests.
+    """
+    from html import escape as _esc
+
     now = datetime.now(timezone.utc)
     results.sort(
         key=lambda r: r["date"] or datetime.min.replace(tzinfo=timezone.utc)
     )
 
-    # ── helpers ─────────────────────────────────────────────
-    def _status_html(days, archived):
-        if archived:
-            return '<span class="status archived">📦 Archived</span>'
-        if days > 5*365:
-            return '<span class="status stale">🔴 5+ yrs</span>'
-        if days > 3*365:
-            return '<span class="status old">🟠 3-5 yrs</span>'
-        if days > 365:
-            return '<span class="status aging">🟡 1-3 yrs</span>'
-        return '<span class="status active">🟢 Active</span>'
+    # Status buckets (oldest → newest), mirroring the Markdown report.
+    CATS = [
+        ("active",   "Active",   "< 1 yr",   365),
+        ("aging",    "Aging",    "1–3 yrs",  3 * 365),
+        ("old",      "Old",      "3–5 yrs",  5 * 365),
+        ("stale",    "Stale",    "5+ yrs",   None),
+        ("archived", "Archived", "archived", None),
+    ]
 
-    def _age_html(days):
-        y, rem = divmod(days, 365)
-        m = rem // 30
-        if y:
-            return f"{y}y {m}m"
-        if m:
-            return f"{m}m"
-        return f"{days}d"
+    def _bucket(r: dict) -> str:
+        if r["archived"]:
+            return "archived"
+        if r.get("date"):
+            d = (now - r["date"]).days
+            if d > 5 * 365:   return "stale"
+            if d > 3 * 365:   return "old"
+            if d > 365:       return "aging"
+            return "active"
+        return "unknown"
 
     # ── stats ───────────────────────────────────────────────
     total_ok = len(results)
     total_err = len(errors)
     total = total_ok + total_err
     total_stars = sum(r.get("stars", 0) for r in results)
-    archived = sum(1 for r in results if r["archived"])
-    active_yr = sum(1 for r in results if r.get("date")
-                    and not r["archived"]
+    active_yr = sum(1 for r in results if r.get("date") and not r["archived"]
                     and (now - r["date"]).days <= 365)
 
-    # Health
+    cat_counts = [sum(1 for r in results if _bucket(r) == cid)
+                  for cid, _l, _s, _u in CATS]
+
     ratio = active_yr / total_ok if total_ok else 0
     if ratio >= 0.9:
-        health_emoji, health_label, health_class = "🟢", "Excellent", "excellent"
+        health_label, health_class = "Excellent", "excellent"
     elif ratio >= 0.7:
-        health_emoji, health_label, health_class = "🟡", "Fair", "fair"
+        health_label, health_class = "Fair", "fair"
     elif ratio >= 0.4:
-        health_emoji, health_label, health_class = "🟠", "Poor", "poor"
+        health_label, health_class = "Poor", "poor"
     else:
-        health_emoji, health_label, health_class = "🔴", "Critical", "critical"
+        health_label, health_class = "Critical", "critical"
 
-    # Counts for summary table
-    cats = [
-        ("Active (< 1 yr)", 0),
-        ("Aging (1-3 yrs)", 0),
-        ("Old (3-5 yrs)", 0),
-        ("Stale (5+ yrs)", 0),
-        ("Archived", 0),
-    ]
-    for r in results:
-        if r["archived"]:
-            cats[4] = (cats[4][0], cats[4][1] + 1)
-        elif r["date"]:
-            d = (now - r["date"]).days
-            if d > 5*365:
-                cats[3] = (cats[3][0], cats[3][1] + 1)
-            elif d > 3*365:
-                cats[2] = (cats[2][0], cats[2][1] + 1)
-            elif d > 365:
-                cats[1] = (cats[1][0], cats[1][1] + 1)
-            else:
-                cats[0] = (cats[0][0], cats[0][1] + 1)
-
-    # ── build rows data ──────────────────────────────────────
+    # ── row data ────────────────────────────────────────────
     rows_data = []
-    for i, r in enumerate(results, 1):
+    for r in results:
         if r["date"]:
             d = (now - r["date"]).days
-            ds = r["date"].strftime("%Y-%m-%d")
-            age = _age_html(d)
-            st_html = _status_html(d, r["archived"])
-            st_sort = "archived" if r["archived"] else (
-                "stale" if d > 5*365 else
-                "old" if d > 3*365 else
-                "aging" if d > 365 else "active"
-            )
+            date = r["date"].strftime("%Y-%m-%d")
+            age = _age_str(d)
+            age_key = d
         else:
-            ds, age, st_html, st_sort = "N/A", "-", "❓", "unknown"
+            date, age, age_key = "—", "—", -1
         rows_data.append({
-            "num": i,
             "name": r["name"],
             "url": r["url"],
-            "date": ds,
+            "date": date,
             "age": age,
-            "stars": r["stars"],
-            "status_html": st_html,
-            "status_sort": st_sort,
+            "age_key": age_key,
+            "stars": int(r.get("stars") or 0),
+            "status": _bucket(r),
         })
 
-    # ── build error rows ─────────────────────────────────────
     err_rows = "".join(
-        f"<tr><td>{i}</td><td><a href='{e['url']}' target='_blank'>{e['name']}</a></td>"
-        f"<td class='err-msg'>{e['error']}</td></tr>"
+        "<tr>"
+        f"<td>{i}</td>"
+        f"<td><a href='{_esc(e['url'])}' target='_blank' rel='noopener'>{_esc(e['name'])}</a></td>"
+        f"<td class='err-msg'>{_esc(e['error'])}</td>"
+        "</tr>"
         for i, e in enumerate(errors, 1)
     )
 
-    # ── build summary rows ───────────────────────────────────
-    ok_total = sum(c[1] for c in cats)
-    summary_rows = "".join(
-        f"<tr><td>{name}</td><td>{count}</td>"
-        f"<td>{count/ok_total*100:.1f}%</td></tr>"
-        if ok_total else f"<tr><td>{name}</td><td>{count}</td><td>-</td></tr>"
-        for name, count in cats
+    # ── chips (status filter + live counts) ─────────────────
+    DOT = {"active": "green", "aging": "amber", "old": "orange",
+           "stale": "red", "archived": "gray"}
+    label_for = {cid: label for cid, label, _s, _u in CATS}
+    chip_rows = (
+        "<button type=\"button\" class=\"chip on\" data-id=\"all\">"
+        "All <span class=\"n\">%d</span></button>" % total_ok
+        + "".join(
+            "<button type=\"button\" class=\"chip\" data-id=\"%s\">"
+            "<span class=\"cdot %s\"></span>%s "
+            "<span class=\"n\">%d</span></button>"
+            % (cid, DOT[cid], label_for[cid], n)
+            for cid, n in zip([c for c, _l, _s, _u in CATS], cat_counts)
+        )
     )
 
-    # ── inline CSS ───────────────────────────────────────────
-    CSS = """*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,Cantarell,sans-serif;background:#1e1e2e;color:#cdd6f4;padding:24px;line-height:1.5}
-.wrap{max-width:1200px;margin:0 auto}
-h1{font-size:1.6rem;color:#b4befe;margin-bottom:4px}
-.sub{color:#a6adc8;font-size:.9rem;margin-bottom:16px}
-.health{display:inline-block;padding:4px 14px;border-radius:20px;font-weight:700;font-size:.85rem}
-.health.excellent{background:#a6e3a1;color:#1e1e2e}
-.health.fair{background:#f9e2af;color:#1e1e2e}
-.health.poor{background:#fab387;color:#1e1e2e}
-.health.critical{background:#f38ba8;color:#1e1e2e}
-.stats{display:flex;gap:16px;flex-wrap:wrap;margin:12px 0 16px;color:#a6adc8;font-size:.85rem}
-.stats span{background:#313244;padding:4px 12px;border-radius:6px}
-.controls{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;align-items:center}
-.controls input,.controls select{padding:7px 10px;border-radius:6px;border:1px solid #45475a;background:#313244;color:#cdd6f4;font-size:.85rem}
-.controls input:focus,.controls select:focus{outline:none;border-color:#89b4fa}
-.controls label{color:#a6adc8;font-size:.85rem}
-table{width:100%;border-collapse:collapse;background:#181825;border-radius:8px;overflow:hidden;margin-bottom:16px}
-th{background:#313244;color:#b4befe;font-weight:600;text-align:left;padding:10px 12px;cursor:pointer;user-select:none;white-space:nowrap;position:relative}
-th:hover{background:#45475a}
-th .arrow{color:#89b4fa;margin-left:4px;font-size:.75rem}
-td{padding:8px 12px;border-bottom:1px solid #313244;font-size:.875rem}
-tr:hover td{background:#2a2a3c}
-a{color:#89b4fa;text-decoration:none}
+    errors_html = ""
+    if errors:
+        errors_html = f"""<details class="panel err-panel" open>
+<summary><span class="sum-in"><span class="chev">▶</span> Errors<span class="errs">{total_err}</span></span></summary>
+<div class="tblwrap"><table class="tbl">
+<thead><tr><th style="width:48px"><div class="ti">#</div></th>
+<th><div class="ti">Repository</div></th>
+<th><div class="ti">Error</div></th></tr></thead>
+<tbody>{err_rows}</tbody></table></div>
+</details>"""
+
+    # ── inline CSS ──────────────────────────────────────────
+    CSS = """\
+:root{
+  --bg:#f5f6f8;--panel:#fff;--panel-2:#fafbfc;--ink:#1b1f24;--ink-2:#57606a;--ink-3:#8b949e;
+  --line:#d8dee4;--line-2:#eaeef2;--accent:#2563eb;--accent-weak:#e9effd;--hl:#f3f4f6;
+  --green:#1a7f37;--green-weak:#dcfce7;--amber:#9a6700;--amber-weak:#fef3c7;
+  --orange:#bc4c00;--orange-weak:#ffedd5;--red:#cf222e;--red-weak:#ffe5e5;
+  --gray:#656d76;--gray-weak:#eef0f2;
+  --shadow:0 1px 2px rgba(16,24,40,.05);--radius:12px;
+}
+@media (prefers-color-scheme:dark){
+:root{
+  --bg:#0d1117;--panel:#161b22;--panel-2:#10151c;--ink:#e6edf3;--ink-2:#9da7b3;--ink-3:#6e7681;
+  --line:#30363d;--line-2:#21262d;--accent:#3d84f7;--accent-weak:#15233f;--hl:#1c2128;
+  --green:#3fb950;--green-weak:#0f2b18;--amber:#d29922;--amber-weak:#2b2310;
+  --orange:#db6d28;--orange-weak:#2d1a0d;--red:#f85149;--red-weak:#331214;
+  --gray:#8b949e;--gray-weak:#21262d;--shadow:0 1px 3px rgba(0,0,0,.35);
+}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);
+font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif}
+a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
-.status{padding:2px 8px;border-radius:4px;font-size:.8rem;white-space:nowrap}
-.status.active{background:#1e3a2f;color:#a6e3a1}
-.status.aging{background:#3a3520;color:#f9e2af}
-.status.old{background:#3a2a1a;color:#fab387}
-.status.stale{background:#3a1a24;color:#f38ba8}
-.status.archived{background:#2a2a3c;color:#a6adc8}
-.num{color:#6c7086;font-size:.8rem;text-align:center;width:36px}
-.stars{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
-.date{white-space:nowrap;font-variant-numeric:tabular-nums}
-h2{color:#b4befe;font-size:1.1rem;margin:20px 0 8px}
-.err-msg{color:#f38ba8}
-.footer{margin-top:24px;padding-top:12px;border-top:1px solid #313244;color:#6c7086;font-size:.8rem;text-align:center}
-.empty{text-align:center;padding:32px;color:#6c7086;font-size:.9rem}
+button{font:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+.wrap{max-width:1160px;margin:0 auto;padding:28px 20px 56px}
+
+/* header */
+.top{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 18px}
+h1{font-size:20px;font-weight:650;letter-spacing:-.01em;margin:0}
+.health{display:inline-flex;align-items:center;gap:6px;padding:4px 11px;border-radius:999px;
+font-size:12px;font-weight:600}
+.health::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.health.excellent{background:var(--green-weak);color:var(--green)}
+.health.fair{background:var(--amber-weak);color:var(--amber)}
+.health.poor{background:var(--orange-weak);color:var(--orange)}
+.health.critical{background:var(--red-weak);color:var(--red)}
+.meta{margin-left:auto;color:var(--ink-3);font-size:12px;font-variant-numeric:tabular-nums}
+
+/* stat cards */
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+padding:13px 15px;box-shadow:var(--shadow)}
+.card .v{font-size:21px;font-weight:650;line-height:1.15;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.card .v em{font-style:normal;font-size:12px;color:var(--ink-3);font-weight:550}
+.card .k{font-size:11px;color:var(--ink-2);margin-top:3px;text-transform:uppercase;letter-spacing:.05em}
+
+/* panel & toolbar */
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+box-shadow:var(--shadow);overflow:hidden;margin-bottom:14px}
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:12px;border-bottom:1px solid var(--line-2)}
+.search{position:relative;flex:1 1 200px;min-width:180px}
+.search svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--ink-3);pointer-events:none}
+#searchBox{width:100%;padding:7px 10px 7px 30px;border:1px solid var(--line);border-radius:8px;
+background:var(--panel-2);color:var(--ink);font:inherit;font-size:13px;outline:none}
+#searchBox:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak)}
+.btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:6px 11px;
+border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;display:inline-flex;gap:6px;
+align-items:center;white-space:nowrap}
+.btn:hover{background:var(--hl)}
+.btn:active{transform:translateY(1px)}
+.count{margin-left:auto;color:var(--ink-3);font-size:12.5px;font-variant-numeric:tabular-nums;white-space:nowrap}
+
+/* filter chips */
+.chips{display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:10px 12px;border-bottom:1px solid var(--line-2)}
+.chip{border:1px solid var(--line);background:var(--panel);color:var(--ink-2);padding:4px 11px;
+border-radius:999px;font-size:12.5px;cursor:pointer;display:inline-flex;gap:6px;align-items:center}
+.chip:hover{border-color:var(--ink-3);color:var(--ink)}
+.chip .n{font-variant-numeric:tabular-nums;color:var(--ink-3);font-size:11.5px}
+.chip.on{border-color:var(--accent);background:var(--accent-weak);color:var(--ink);font-weight:550}
+.chip.on .n{color:var(--accent)}
+.cdot{width:7px;height:7px;border-radius:50%;background:var(--gray)}
+.cdot.green{background:var(--green)}.cdot.amber{background:var(--amber)}
+.cdot.orange{background:var(--orange)}.cdot.red{background:var(--red)}
+
+/* table */
+.tblwrap{overflow-x:auto}
+.tbl{width:100%;border-collapse:collapse;font-size:13.5px}
+.tbl th{position:sticky;top:0;background:var(--panel);text-align:left;font-weight:600;
+font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-2);padding:0;
+border-bottom:1px solid var(--line);white-space:nowrap;cursor:pointer;user-select:none;z-index:1}
+.tbl th .ti{display:flex;align-items:center;gap:5px;padding:9px 12px}
+.tbl th:hover{color:var(--ink)}
+.tbl th .arr{font-size:8px;color:var(--accent);opacity:0}
+.tbl th.sorted{color:var(--ink)}
+.tbl th.sorted .arr{opacity:1}
+.tbl td{padding:8px 12px;border-bottom:1px solid var(--line-2);vertical-align:middle}
+.tbl tbody tr:nth-child(even){background:var(--panel-2)}
+.tbl tbody tr:hover{background:var(--hl)}
+.tbl tbody tr:last-child td{border-bottom:0}
+.tbl .date{white-space:nowrap;color:var(--ink-2);font-variant-numeric:tabular-nums}
+.tbl .age{white-space:nowrap;color:var(--ink-2)}
+.tbl .stars{white-space:nowrap;text-align:right;font-variant-numeric:tabular-nums}
+.repo-name{font-weight:550;overflow-wrap:anywhere}
+.stars .ic{vertical-align:-2px;margin-right:5px}
+.status{display:inline-flex;align-items:center;gap:7px;white-space:nowrap;font-size:12.5px}
+.dot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--gray)}
+.dot.green{background:var(--green)}.dot.amber{background:var(--amber)}
+.dot.orange{background:var(--orange)}.dot.red{background:var(--red)}
+.err-msg{color:var(--red);overflow-wrap:anywhere}
+.empty{padding:36px 12px;text-align:center;color:var(--ink-3)}
+
+/* collapsible errors */
+.err-panel>summary{list-style:none;cursor:pointer}
+.err-panel>summary::-webkit-details-marker{display:none}
+.sum-in{display:flex;align-items:center;gap:9px;padding:11px 14px;font-weight:600;user-select:none}
+.sum-in:hover{background:var(--hl)}
+.chev{color:var(--ink-3);font-size:9px;transition:transform .15s}
+.err-panel[open] .chev{transform:rotate(90deg)}
+.errs{margin-left:auto;background:var(--red-weak);color:var(--red);border-radius:999px;
+font-size:11.5px;font-weight:600;padding:1px 9px;font-variant-numeric:tabular-nums}
+
+.footer{margin-top:26px;text-align:center;color:var(--ink-3);font-size:12px}
+.kbd{border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;padding:0 5px;
+font-size:11px;color:var(--ink-2);font-family:inherit}
+.toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,10px);background:var(--ink);
+color:var(--bg);padding:8px 16px;border-radius:9px;font-size:13px;opacity:0;pointer-events:none;
+transition:.2s ease;z-index:20}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+
+@media (max-width:840px){
+  .cards{grid-template-columns:repeat(2,1fr)}
+  .meta{margin-left:0;width:100%}
+  .count{display:none}
+}
 """
 
-    # ── inline JS ────────────────────────────────────────────
-    # We embed the data as JSON, then JS builds the table + sorting/filtering
-    rows_json = json.dumps(rows_data)
-    err_count = total_err
+    # ── inline JS ───────────────────────────────────────────
+    # __DATA__ is substituted below. '<' is escaped in the JSON so a repo
+    # name can never close the script tag.
+    JS = r"""
+const data = __DATA__;
+const STATUSES = ["active", "aging", "old", "stale", "archived"];
+const STATUS_LABEL = {active: "Active", aging: "Aging", old: "Old",
+                      stale: "Stale", archived: "Archived"};
+const DOT_CLASS = {active: "green", aging: "amber", old: "orange",
+                   stale: "red", archived: "gray"};
+const STAR_SVG = '<svg class="ic" width="11" height="11" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.75.75 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z"/></svg>';
 
-    JS = f"""
-const data = {rows_json};
-let sortCol = null, sortAsc = true;
+let sortCol = "age";
+let sortAsc = false;  // oldest first by default
+let stFilter = "all";
+let q = "";
 
-function render() {{
-    const statusFilter = document.getElementById('statusFilter').value;
-    const searchVal = document.getElementById('searchBox').value.toLowerCase();
-    const tbody = document.getElementById('repoBody');
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
+function shortStars(n) {
+  return n >= 1000 ? (n / 1000).toFixed(n % 1000 === 0 ? 0 : 1) + "k" : String(n);
+}
+function matches(r) {
+  if (stFilter !== "all" && r.status !== stFilter) return false;
+  if (q && !(r.name.toLowerCase().includes(q) || r.date.includes(q))) return false;
+  return true;
+}
 
-    // Filter
-    let filtered = data;
-    if (statusFilter !== 'all') {{
-        filtered = filtered.filter(r => r.status_sort === statusFilter);
-    }}
-    if (searchVal) {{
-        filtered = filtered.filter(r =>
-            r.name.toLowerCase().includes(searchVal) ||
-            r.date.includes(searchVal)
-        );
-    }}
+function render() {
+  const tbody = document.getElementById("repoBody");
+  const dir = sortAsc ? 1 : -1;
+  const sorted = data.slice().sort((a, b) => {
+    let va, vb;
+    if (sortCol === "name")        { va = a.name.toLowerCase(); vb = b.name.toLowerCase(); }
+    else if (sortCol === "stars")  { va = a.stars; vb = b.stars; }
+    else if (sortCol === "status") { va = STATUSES.indexOf(a.status); vb = STATUSES.indexOf(b.status); }
+    else if (sortCol === "date")   { va = a.date === "—" ? "" : a.date; vb = b.date === "—" ? "" : b.date; }
+    else                           { va = a.age_key; vb = b.age_key; }
+    if (va < vb) return -dir;
+    if (va > vb) return dir;
+    return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+  });
 
-    // Sort
-    if (sortCol !== null) {{
-        filtered.sort((a, b) => {{
-            let va, vb;
-            if (sortCol === 'stars') {{ va = a.stars; vb = b.stars; }}
-            else if (sortCol === 'date') {{ va = a.date; vb = b.date; }}
-            else if (sortCol === 'name') {{ va = a.name.toLowerCase(); vb = b.name.toLowerCase(); }}
-            else if (sortCol === 'status') {{ va = a.status_sort; vb = b.status_sort; }}
-            else if (sortCol === 'age') {{
-                va = a.age === '-' ? -1 : parseInt(a.age);
-                vb = b.age === '-' ? -1 : parseInt(b.age);
-            }}
-            else {{ va = a.num; vb = b.num; }}
-            if (va < vb) return sortAsc ? -1 : 1;
-            if (va > vb) return sortAsc ? 1 : -1;
-            return 0;
-        }});
-    }}
+  let html = "";
+  let shown = 0;
+  for (const r of sorted) {
+    if (!matches(r)) continue;
+    shown++;
+    html += "<tr>"
+      + "<td><a class=\"repo-name\" href=\"" + esc(r.url) + "\" target=\"_blank\" rel=\"noopener\">" + esc(r.name) + "</a></td>"
+      + "<td class=\"date\">" + r.date + "</td>"
+      + "<td class=\"age\">" + r.age + "</td>"
+      + "<td class=\"stars\" title=\"" + r.stars.toLocaleString() + " stars\">" + STAR_SVG + shortStars(r.stars) + "</td>"
+      + "<td><span class=\"status\"><span class=\"dot " + (DOT_CLASS[r.status] || "") + "\"></span>" + (STATUS_LABEL[r.status] || r.status) + "</span></td>"
+      + "</tr>";
+  }
+  tbody.innerHTML = shown ? html
+    : "<tr><td colspan=\"5\" class=\"empty\">No repositories match the current search or filter.</td></tr>";
+  document.getElementById("count").textContent = shown + " / " + data.length;
+}
 
-    // Build table
-    if (filtered.length === 0) {{
-        tbody.innerHTML = '<tr><td colspan="6" class="empty">No repos match your filter</td></tr>';
-        document.getElementById('resultCount').textContent = '0 / ' + data.length;
-        return;
-    }}
-    document.getElementById('resultCount').textContent = filtered.length + ' / ' + data.length;
-    tbody.innerHTML = filtered.map(r => `
-        <tr>
-            <td class="num">${{r.num}}</td>
-            <td><a href="${{r.url}}" target="_blank">${{r.name}}</a></td>
-            <td class="date">${{r.date}}</td>
-            <td>${{r.age}}</td>
-            <td class="stars">${{r.stars.toLocaleString()}}</td>
-            <td>${{r.status_html}}</td>
-        </tr>
-    `).join('');
+function setFilter(id) {
+  stFilter = id;
+  document.querySelectorAll("#chips .chip").forEach(c =>
+    c.classList.toggle("on", c.dataset.id === id));
+  render();
+}
+function sortBy(col) {
+  if (sortCol === col) sortAsc = !sortAsc;
+  else { sortCol = col; sortAsc = true; }
+  document.querySelectorAll(".tbl th[data-col]").forEach(th => {
+    const on = th.dataset.col === sortCol;
+    th.classList.toggle("sorted", on);
+    th.querySelector(".arr").textContent = on ? (sortAsc ? "▲" : "▼") : "";
+  });
+  render();
+}
 
-    // Update arrows
-    document.querySelectorAll('th .arrow').forEach(a => a.remove());
-    if (sortCol !== null) {{
-        const th = document.getElementById('th-' + sortCol);
-        if (th) {{
-            const arrow = document.createElement('span');
-            arrow.className = 'arrow';
-            arrow.textContent = sortAsc ? ' ▲' : ' ▼';
-            th.appendChild(arrow);
-        }}
-    }}
-}}
+function exportCSV() {
+  const rows = [["Repository", "URL", "Last commit", "Age (days)", "Stars", "Status"]];
+  for (const r of data) {
+    if (!matches(r)) continue;
+    rows.push([r.name, r.url, r.date,
+               r.age_key >= 0 ? String(r.age_key) : "",
+               String(r.stars), STATUS_LABEL[r.status] || r.status]);
+  }
+  const csv = rows.map(row => row.map(c => {
+    c = String(c == null ? "" : c);
+    return /[",\n]/.test(c) ? '"' + c.replace(/"/g, '""') + '"' : c;
+  }).join(",")).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(["\ufeff" + csv],
+                                        {type: "text/csv;charset=utf-8"}));
+  a.download = "repo-freshness-report.csv";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 300);
+  const t = document.getElementById("toast");
+  t.textContent = "Exported " + (rows.length - 1) + " rows to CSV";
+  t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 1800);
+}
 
-function sortBy(col) {{
-    if (sortCol === col) {{ sortAsc = !sortAsc; }}
-    else {{ sortCol = col; sortAsc = true; }}
+function init() {
+  document.getElementById("searchBox").addEventListener("input", e => {
+    q = e.target.value.trim().toLowerCase();
     render();
-}}
-
-document.addEventListener('DOMContentLoaded', () => {{
-    document.getElementById('searchBox').addEventListener('input', render);
-    document.getElementById('statusFilter').addEventListener('change', render);
-    render();
-}});
+  });
+  document.getElementById("clearBtn").addEventListener("click", () => {
+    document.getElementById("searchBox").value = "";
+    q = "";
+    setFilter("all");
+  });
+  document.getElementById("exportBtn").addEventListener("click", exportCSV);
+  document.querySelectorAll("#chips .chip").forEach(chip => {
+    chip.addEventListener("click", () => setFilter(chip.dataset.id));
+  });
+  document.querySelectorAll(".tbl th[data-col]").forEach(th => {
+    th.tabIndex = 0;
+    th.addEventListener("click", () => sortBy(th.dataset.col));
+    th.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        sortBy(th.dataset.col);
+      }
+    });
+  });
+  document.addEventListener("keydown", e => {
+    const box = document.getElementById("searchBox");
+    const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
+    if (e.key === "/" && !typing) { e.preventDefault(); box.focus(); }
+    if (e.key === "Escape" && document.activeElement === box) {
+      box.value = ""; q = ""; render(); box.blur();
+    }
+  });
+  render();
+}
+document.addEventListener("DOMContentLoaded", init);
 """
+
+    rows_json = json.dumps(rows_data).replace("<", "\\u003c")
+    js = JS.replace("__DATA__", rows_json)
 
     HTML = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
 <title>Repository Freshness Report</title>
 <style>{CSS}</style>
 </head>
 <body>
 <div class="wrap">
-<h1>📊 Repository Freshness Report</h1>
-<div class="sub">
-    <span class="health {health_class}">{health_emoji} {health_label}</span>
-    &nbsp; Generated: {now.strftime('%Y-%m-%d %H:%M UTC')} &nbsp;·&nbsp; {total} repos
-</div>
 
-<div class="stats">
-    <span>⭐ {total_stars:,} total stars</span>
-    <span>📦 {archived} archived</span>
-    <span>⚠️ {total_err} errors</span>
-    <span>📋 <span id="resultCount">{total_ok} / {total_ok}</span> shown</span>
-</div>
+<header class="top">
+  <h1>Repository Freshness</h1>
+  <span class="health {health_class}">{health_label}</span>
+  <span class="meta">{total} repos · generated {now.strftime('%Y-%m-%d %H:%M UTC')}</span>
+</header>
 
-<h2>📋 Summary</h2>
-<table>
-<thead><tr><th>Category</th><th>Count</th><th>Share</th></tr></thead>
-<tbody>{summary_rows}</tbody>
-</table>
+<section class="cards" aria-label="Summary">
+  <div class="card"><div class="v">{total:,}</div><div class="k">Repos checked</div></div>
+  <div class="card"><div class="v">{active_yr:,} <em>/ {total_ok}</em></div><div class="k">Active in last year</div></div>
+  <div class="card"><div class="v">{total_stars:,}</div><div class="k">Total stars</div></div>
+  <div class="card"><div class="v">{total_err}</div><div class="k">Errors</div></div>
+</section>
 
-<h2>📌 Repositories</h2>
-<div class="controls">
-    <label for="searchBox">🔍 Search:</label>
-    <input type="text" id="searchBox" placeholder="Repo name or date…">
-    <label for="statusFilter">Status:</label>
-    <select id="statusFilter">
-        <option value="all">All</option>
-        <option value="active">🟢 Active</option>
-        <option value="aging">🟡 Aging</option>
-        <option value="old">🟠 Old</option>
-        <option value="stale">🔴 Stale</option>
-        <option value="archived">📦 Archived</option>
-    </select>
-</div>
-<table>
-<thead>
-<tr>
-    <th id="th-num" onclick="sortBy('num')" style="width:36px">#<span class="arrow"> ▲</span></th>
-    <th id="th-name" onclick="sortBy('name')">Repository</th>
-    <th id="th-date" onclick="sortBy('date')">Last Commit</th>
-    <th id="th-age" onclick="sortBy('age')">Age</th>
-    <th id="th-stars" onclick="sortBy('stars')">⭐</th>
-    <th id="th-status" onclick="sortBy('status')">Status</th>
-</tr>
-</thead>
-<tbody id="repoBody"></tbody>
-</table>
-"""
+<section class="panel">
+  <div class="toolbar">
+    <div class="search">
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="7" cy="7" r="4.75"/><path d="m10.9 10.9 3.3 3.3"/></svg>
+      <input type="search" id="searchBox" placeholder="Search name or date…" autocomplete="off" aria-label="Search repositories">
+    </div>
+    <button type="button" class="btn" id="clearBtn">Reset</button>
+    <button type="button" class="btn" id="exportBtn" title="Download the currently visible rows as CSV">
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M8 2.5v7m0 0L5 6.8m3 2.7 3-2.7M2.5 11.5v1.2A1.3 1.3 0 0 0 3.8 14h8.4a1.3 1.3 0 0 0 1.3-1.3v-1.2"/></svg>
+      CSV
+    </button>
+    <span class="count" id="count">—</span>
+  </div>
+  <div class="chips" id="chips" role="group" aria-label="Filter by status">
+    {chip_rows}
+  </div>
+  <div class="tblwrap">
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th data-col="name"><div class="ti">Repository<span class="arr"></span></div></th>
+          <th data-col="date"><div class="ti">Last commit<span class="arr"></span></div></th>
+          <th data-col="age" class="sorted"><div class="ti">Age<span class="arr">▼</span></div></th>
+          <th data-col="stars"><div class="ti" style="justify-content:flex-end">Stars<span class="arr"></span></div></th>
+          <th data-col="status"><div class="ti">Status<span class="arr"></span></div></th>
+        </tr>
+      </thead>
+      <tbody id="repoBody"></tbody>
+    </table>
+  </div>
+</section>
 
-    if errors:
-        HTML += f"""<h2>⚠️ Errors ({err_count})</h2>
-<table>
-<thead><tr><th>#</th><th>Repository</th><th>Error</th></tr></thead>
-<tbody>{err_rows}</tbody>
-</table>
-"""
+{errors_html}
 
-    HTML += f"""<div class="footer">
-Repo Freshness Checker v{VERSION} &nbsp;·&nbsp; Generated {now.strftime('%Y-%m-%d %H:%M UTC')}
+<div class="footer">
+  Repo Freshness Checker v{VERSION} · generated {now.strftime('%Y-%m-%d %H:%M UTC')} ·
+  <span class="kbd">/</span> focus search · <span class="kbd">esc</span> clear
 </div>
-</div>
-<script>{JS}</script>
+<div class="toast" id="toast" role="status"></div>
+<script>{js}</script>
 </body>
 </html>"""
 
@@ -1090,535 +1229,542 @@ Repo Freshness Checker v{VERSION} &nbsp;·&nbsp; Generated {now.strftime('%Y-%m-
 
 # ═══════════════════════════ GUI ════════════════════════════════
 def run_gui():
-    """Modern dark-themed GUI with tkinter."""
+    """Dark, flat tkinter GUI.  Native widgets only — ttk theming plus
+    plain tk controls styled through the option database and a tiny
+    palette, so it looks the same on Windows / macOS / Linux."""
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox, scrolledtext
     import webbrowser
 
-    # ── colour palette ────────────────────────────────────────
+    # ── palette ──────────────────────────────────────────────
     class Palette:
-        BG        = "#1e1e2e"  # base
-        SURFACE   = "#2a2a3c"  # surface0
-        SURF_ALT  = "#313244"  # surface1
-        TEXT      = "#cdd6f4"  # text
-        SUBTEXT   = "#a6adc8"  # subtext0
-        ACCENT    = "#89b4fa"  # blue
-        GREEN     = "#a6e3a1"  # green
-        RED       = "#f38ba8"  # red
-        YELLOW    = "#f9e2af"  # yellow
-        BORDER    = "#45475a"  # surface2
-        HEADING   = "#b4befe"  # lavender
+        BG       = "#101014"   # window
+        SURFACE  = "#191920"   # panels / bars
+        SURF_ALT = "#22222b"   # fields, chips
+        SURF_DEEP= "#0c0c10"   # log canvas
+        BORDER   = "#30303b"   # hairlines, field outlines
+        TEXT     = "#e7eaf0"   # primary text
+        SUBTEXT  = "#97a0b0"   # secondary text
+        FAINT    = "#626b7a"   # hints, placeholders
+        ACCENT   = "#5b9dff"   # interactive blue
+        ACCENT_H = "#7ab4ff"
+        ACCENT_P = "#4a86e0"
+        ONACCENT = "#0b1017"
+        GREEN    = "#7ee2a8"
+        RED      = "#ff7b72"
+        YELLOW   = "#e3b341"
 
-    # ── ttk theme builder ──────────────────────────────────────
-    def _build_theme(style: ttk.Style) -> str:
-        theme = "freshness"
-        # Try to use an existing theme as base - "alt" works cross-platform
-        available = style.theme_names()
-        base = "alt" if "alt" in available else "default"
-        style.theme_use(base)
-        # We configure our custom colours on top of the base theme
-        style.theme_create(theme, base, {
-            "TFrame":       {"configure": {"background": Palette.BG}},
-            "TLabel":       {"configure": {"background": Palette.BG,
-                                           "foreground": Palette.TEXT}},
-            "TButton":      {"configure": {"background": Palette.SURFACE,
-                                           "foreground": Palette.TEXT,
-                                           "borderwidth": 0,
-                                           "padding": (16, 6)},
-                             "map": {"background": [("active", Palette.ACCENT),
-                                                    ("disabled", Palette.SURF_ALT)],
-                                     "foreground": [("active", Palette.BG),
-                                                    ("disabled", Palette.SUBTEXT)]}},
-            "TCheckbutton": {"configure": {"background": Palette.BG,
-                                           "foreground": Palette.TEXT}},
-            "TEntry":       {"configure": {"fieldbackground": Palette.SURF_ALT,
-                                           "foreground": Palette.TEXT,
-                                           "insertcolor": Palette.TEXT}},
-            "TSpinbox":     {"configure": {"fieldbackground": Palette.SURF_ALT,
-                                           "foreground": Palette.TEXT,
-                                           "buttonbackground": Palette.SURFACE}},
-            "TLabelFrame":  {"configure": {"background": Palette.BG,
-                                           "foreground": Palette.HEADING,
-                                           "borderwidth": 1}},
-            "TProgressbar": {"configure": {"background": Palette.ACCENT,
-                                           "troughcolor": Palette.SURF_ALT,
-                                           "borderwidth": 0}},
-            "Horizontal.TProgressbar":
-                            {"configure": {"background": Palette.ACCENT,
-                                           "troughcolor": Palette.SURF_ALT,
-                                           "borderwidth": 0}},
-        })
-        # Style for prominent action button
-        style.configure("Accent.TButton", background=Palette.ACCENT,
-                        foreground=Palette.BG, font=("sans-serif", 10, "bold"))
+    # ── ttk theme ────────────────────────────────────────────
+    def _build_theme(style: ttk.Style) -> None:
+        avail = style.theme_names()
+        base = ("alt" if "alt" in avail else
+                "clam" if "clam" in avail else "default")
+        try:
+            style.theme_use(base)
+        except tk.TclError:
+            pass
+        name = "rfc"
+        try:
+            style.theme_create(name, base, {
+                "TFrame":      {"configure": {"background": Palette.BG}},
+                "TLabel":      {"configure": {"background": Palette.BG,
+                                              "foreground": Palette.TEXT}},
+                "TButton":     {"configure": {"background": Palette.SURFACE,
+                                              "foreground": Palette.TEXT,
+                                              "borderwidth": 0,
+                                              "padding": (13, 6)},
+                                "map": {"background": [("pressed", Palette.BORDER),
+                                                       ("active", Palette.SURF_ALT),
+                                                       ("disabled", Palette.SURFACE)],
+                                        "foreground": [("disabled", Palette.FAINT)]}},
+                "TCheckbutton": {"configure": {"background": Palette.BG,
+                                               "foreground": Palette.SUBTEXT},
+                                 "map": {"background": [("active", Palette.BG)]}},
+                "TSpinbox":    {"configure": {"fieldbackground": Palette.SURF_ALT,
+                                              "foreground": Palette.TEXT,
+                                              "buttonbackground": Palette.SURF_ALT,
+                                              "padding": (4, 3)}},
+                "TProgressbar": {"configure": {"background": Palette.ACCENT,
+                                               "troughcolor": Palette.SURF_ALT,
+                                               "borderwidth": 0}},
+                "Horizontal.TProgressbar":
+                               {"configure": {"background": Palette.ACCENT,
+                                              "troughcolor": Palette.SURF_ALT,
+                                              "borderwidth": 0}},
+            })
+            style.theme_use(name)
+        except tk.TclError:
+            # fall back to configuring whatever theme is active
+            pass
+
+        style.configure("Accent.TButton",
+                        background=Palette.ACCENT, foreground=Palette.ONACCENT,
+                        font=("sans-serif", 10, "bold"), padding=(18, 7))
         style.map("Accent.TButton",
-                  background=[("active", "#74c7ec"), ("disabled", Palette.SURF_ALT)],
-                  foreground=[("disabled", Palette.SUBTEXT)])
-        style.configure("Stop.TButton", background=Palette.RED,
+                  background=[("pressed", Palette.ACCENT_P),
+                              ("active", Palette.ACCENT_H),
+                              ("disabled", Palette.SURF_ALT)],
+                  foreground=[("disabled", Palette.FAINT)])
+        style.configure("Ghost.TButton",
+                        background=Palette.BG, foreground=Palette.SUBTEXT,
+                        padding=(10, 5))
+        style.map("Ghost.TButton",
+                  background=[("active", Palette.SURF_ALT),
+                              ("pressed", Palette.BORDER),
+                              ("disabled", Palette.BG)],
+                  foreground=[("disabled", Palette.FAINT),
+                              ("active", Palette.TEXT)])
+        style.configure("Danger.TButton",
+                        background=Palette.BG, foreground=Palette.RED,
+                        borderwidth=0, padding=(13, 6))
+        style.map("Danger.TButton",
+                  background=[("active", Palette.SURFACE),
+                              ("pressed", Palette.BORDER),
+                              ("disabled", Palette.BG)],
+                  foreground=[("disabled", Palette.FAINT)])
+        style.configure("Title.TLabel",
+                        font=("sans-serif", 15, "bold"),
                         foreground=Palette.TEXT)
-        style.map("Stop.TButton",
-                  background=[("active", "#e64553"), ("disabled", Palette.SURF_ALT)])
-        style.configure("Status.TLabel", background=Palette.SURFACE,
-                        foreground=Palette.SUBTEXT, relief="sunken",
-                        padding=(8, 2))
-        style.configure("Heading.TLabel", font=("sans-serif", 11, "bold"),
-                        foreground=Palette.HEADING)
-        style.configure("Link.TLabel", foreground=Palette.ACCENT,
-                        background=Palette.BG)
-        style.theme_use(theme)
-        return theme
+        style.configure("Section.TLabel",
+                        font=("sans-serif", 9, "bold"),
+                        foreground=Palette.SUBTEXT)
+        style.configure("Caption.TLabel",
+                        font=("sans-serif", 8),
+                        foreground=Palette.FAINT)
+        style.configure("Status.TLabel",
+                        background=Palette.SURFACE,
+                        foreground=Palette.SUBTEXT)
+        style.configure("Stats.TLabel",
+                        background=Palette.SURFACE,
+                        foreground=Palette.SUBTEXT,
+                        font=("sans-serif", 9))
 
     class App(tk.Tk):
+        CONFIG_FILE = CONFIG_DIR / "gui_config.json"
+
+        # ── setup ────────────────────────────────────────────
         def __init__(self):
             super().__init__()
-            self.title(f"GitHub Repo Freshness Checker  v{VERSION}")
-            self.geometry("880x680")
-            self.minsize(720, 520)
+            self.title("Repo Freshness Checker")
+            self.geometry("880x700")
+            self.minsize(760, 560)
+
             self.cancel_event = threading.Event()
             self.running = False
-            self.last_results = None
-            self.last_errors = None
+            self.last_results: list | None = None
+            self.last_errors: list | None = None
             self.input_files: list[str] = []
 
-            # Apply dark theme
+            self.configure(bg=Palette.BG)
+            self._tk_base_fonts()
             style = ttk.Style(self)
             _build_theme(style)
 
-            # Configure root window
-            self.configure(bg=Palette.BG)
-            self.option_add("*foreground", Palette.TEXT)
-            self.option_add("*background", Palette.BG)
-
-            # Configure tk widgets that ttk doesn't cover
-            self._tk_config()
-
             self._build()
+            self._setup_drag_drop()
+
+            self._load_config()
             saved = load_token()
             if saved:
                 self.tok_var.set(saved)
-            self._load_config()
+                self.remember_var.set(True)
 
-        def _tk_config(self):
-            """Style plain tk widgets (not covered by ttk)."""
+        def _tk_base_fonts(self):
+            # Tk's native widgets keep a consistent font stack too
+            try:
+                import tkinter.font as tkfont
+                base = tkfont.nametofont("TkDefaultFont")
+                base.configure(family="sans-serif", size=10)
+                ui = tkfont.nametofont("TkTextFont")
+                ui.configure(family="sans-serif", size=10)
+                f = tkfont.nametofont("TkFixedFont")
+                f.configure(family="Consolas" if sys.platform == "win32"
+                            else "Menlo" if sys.platform == "darwin"
+                            else "monospace", size=10)
+            except Exception:
+                pass
             self.option_add("*Entry.background", Palette.SURF_ALT)
             self.option_add("*Entry.foreground", Palette.TEXT)
             self.option_add("*Entry.insertBackground", Palette.TEXT)
             self.option_add("*Entry.highlightBackground", Palette.BORDER)
             self.option_add("*Entry.highlightColor", Palette.ACCENT)
-            self.option_add("*Listbox.background", Palette.SURF_ALT)
-            self.option_add("*Listbox.foreground", Palette.TEXT)
-            self.option_add("*Text.background", Palette.SURF_ALT)
+            self.option_add("*Entry.relief", "flat")
+            self.option_add("*Entry.borderWidth", 0)
+            self.option_add("*Text.background", Palette.SURF_DEEP)
             self.option_add("*Text.foreground", Palette.TEXT)
             self.option_add("*Text.insertBackground", Palette.TEXT)
+            self.option_add("*Text.highlightBackground", Palette.BORDER)
+            self.option_add("*Text.highlightColor", Palette.BORDER)
+            self.option_add("*Text.relief", "flat")
+            self.option_add("*Text.borderWidth", 0)
+            self.option_add("*Listbox.background", Palette.SURF_ALT)
+            self.option_add("*Listbox.foreground", Palette.TEXT)
 
-        # ── build UI ──────────────────────────────────────────
+        # ── small builders ───────────────────────────────────
+        def _field(self, parent) -> tk.Entry:
+            return tk.Entry(parent, bg=Palette.SURF_ALT, fg=Palette.TEXT,
+                            insertbackground=Palette.TEXT, relief="flat",
+                            borderwidth=0, highlightthickness=1,
+                            highlightbackground=Palette.BORDER,
+                            highlightcolor=Palette.ACCENT)
+
+        # ── layout ───────────────────────────────────────────
         def _build(self):
-            pad = dict(padx=8, pady=5)
-            main = ttk.Frame(self, padding=14)
+            main = ttk.Frame(self, padding=(18, 14, 18, 10))
             main.pack(fill="both", expand=True)
 
-            # ── Header ────────────────────────────────────────
-            header = ttk.Frame(main)
-            header.pack(fill="x", **pad)
-            ttk.Label(header, text="🔍 Repo Freshness Checker",
-                      style="Heading.TLabel").pack(side="left")
-            ttk.Label(header, text=f"v{VERSION}",
-                      foreground=Palette.SUBTEXT).pack(side="left", padx=(6, 0))
+            # header
+            hdr = ttk.Frame(main)
+            hdr.pack(fill="x")
+            ttk.Label(hdr, text="Repo Freshness Checker",
+                      style="Title.TLabel").pack(side="left")
+            chip = tk.Label(hdr, text=f"v{VERSION}", bg=Palette.SURF_ALT,
+                            fg=Palette.SUBTEXT, padx=8, pady=2,
+                            font=("sans-serif", 8))
+            chip.pack(side="left", padx=(9, 0))
+            ttk.Label(hdr, text="GitHub repo activity → Markdown + HTML report",
+                      style="Caption.TLabel").pack(side="right")
 
-            # ── Token section ─────────────────────────────────
-            tf = ttk.LabelFrame(main, text="Authentication", padding=10)
-            tf.pack(fill="x", **pad)
+            self._rule(main)
 
-            # Token entry row
-            row0 = ttk.Frame(tf)
-            row0.pack(fill="x")
-            ttk.Label(row0, text="Personal Access Token:").pack(side="left")
-            self.tok_var = tk.StringVar()
-            self.tok_entry = tk.Entry(row0, textvariable=self.tok_var,
-                                      width=48, show="●",
-                                      bg=Palette.SURF_ALT, fg=Palette.TEXT,
-                                      insertbackground=Palette.TEXT,
-                                      relief="flat", highlightthickness=1,
-                                      highlightbackground=Palette.BORDER,
-                                      highlightcolor=Palette.ACCENT)
-            self.tok_entry.pack(side="left", fill="x", expand=True, padx=6)
-            self._show_tok = False
-            self.eye_btn = ttk.Button(row0, text="Show", width=5,
-                                      command=self._toggle_tok)
-            self.eye_btn.pack(side="left", padx=1)
-            ttk.Button(row0, text="Save", width=5,
-                       command=self._save_tok).pack(side="left", padx=1)
-            ttk.Button(row0, text="Clear", width=5,
-                       command=self._clear_tok).pack(side="left", padx=1)
+            # ── source & target ──────────────────────────────
+            grid = ttk.Frame(main)
+            grid.pack(fill="x")
+            grid.columnconfigure(0, weight=3, uniform="cols")
+            grid.columnconfigure(1, weight=2, uniform="cols")
 
-            # Clickable token link row
-            row1 = ttk.Frame(tf)
-            row1.pack(fill="x", pady=(6, 0))
-            link_lbl = tk.Label(row1,
-                text="🔑 Generate a token (no scopes needed for public repos)",
-                fg=Palette.ACCENT, bg=Palette.BG,
-                cursor="hand2", font=("sans-serif", 9))
-            link_lbl.pack(side="left")
-            link_lbl.bind("<Button-1>", lambda e: webbrowser.open(
-                "https://github.com/settings/tokens"))
-            link_lbl.bind("<Enter>", lambda e: link_lbl.configure(
-                font=("sans-serif", 9, "underline")))
-            link_lbl.bind("<Leave>", lambda e: link_lbl.configure(
-                font=("sans-serif", 9)))
-
-            # ── Files section ─────────────────────────────────
-            ff = ttk.LabelFrame(main, text="Files", padding=10)
-            ff.pack(fill="x", **pad)
-
-            # Input
-            fi0 = ttk.Frame(ff)
-            fi0.pack(fill="x")
-            ttk.Label(fi0, text="Input folder:").pack(side="left")
+            # input
+            left = ttk.Frame(grid)
+            left.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+            ttk.Label(left, text="SOURCE", style="Section.TLabel").pack(anchor="w")
+            row1 = ttk.Frame(left)
+            row1.pack(fill="x", pady=(5, 0))
             self.in_var = tk.StringVar()
-            self.in_entry = tk.Entry(fi0, textvariable=self.in_var,
-                                     bg=Palette.SURF_ALT, fg=Palette.TEXT,
-                                     insertbackground=Palette.TEXT,
-                                     relief="flat", highlightthickness=1,
-                                     highlightbackground=Palette.BORDER,
-                                     highlightcolor=Palette.ACCENT)
-            self.in_entry.pack(side="left", fill="x", expand=True, padx=6)
-            ttk.Button(fi0, text="Choose folder…",
-                       command=self._browse_in).pack(side="left")
+            self.in_entry = self._field(row1)
+            self.in_entry.pack(side="left", fill="x", expand=True, ipady=4)
+            ttk.Button(row1, text="Browse…", style="Ghost.TButton",
+                       command=self._browse_in).pack(side="left", padx=(6, 0))
+            self.src_hint = ttk.Label(
+                left, style="Caption.TLabel",
+                text="Markdown files or a folder containing them")
+            self.src_hint.pack(anchor="w", pady=(3, 0))
 
-
-
-            # Output
-            fi1 = ttk.Frame(ff)
-            fi1.pack(fill="x", pady=(8, 0))
-            ttk.Label(fi1, text="Output file:").pack(side="left")
+            # output
+            right = ttk.Frame(grid)
+            right.grid(row=0, column=1, sticky="ew")
+            ttk.Label(right, text="REPORT", style="Section.TLabel").pack(anchor="w")
+            row2 = ttk.Frame(right)
+            row2.pack(fill="x", pady=(5, 0))
             self.out_var = tk.StringVar(value="freshness_report.md")
-            tk.Entry(fi1, textvariable=self.out_var,
-                     bg=Palette.SURF_ALT, fg=Palette.TEXT,
-                     insertbackground=Palette.TEXT,
-                     relief="flat", highlightthickness=1,
-                     highlightbackground=Palette.BORDER,
-                     highlightcolor=Palette.ACCENT).pack(
-                         side="left", fill="x", expand=True, padx=6)
-            ttk.Button(fi1, text="Browse…",
-                       command=self._browse_out).pack(side="left")
+            self.out_entry = self._field(row2)
+            self.out_entry.pack(side="left", fill="x", expand=True, ipady=4)
+            ttk.Button(row2, text="Browse…", style="Ghost.TButton",
+                       command=self._browse_out).pack(side="left", padx=(6, 0))
+            ttk.Label(right, style="Caption.TLabel",
+                      text="Saved as .md — an HTML version is written beside it"
+            ).pack(anchor="w", pady=(3, 0))
 
-            # ── Controls ──────────────────────────────────────
-            cf = ttk.Frame(main)
-            cf.pack(fill="x", **pad)
+            # ── authentication ───────────────────────────────
+            self._rule(main)
+            auth = ttk.Frame(main)
+            auth.pack(fill="x")
+            ttk.Label(auth, text="TOKEN", style="Section.TLabel").pack(side="left")
+            link = tk.Label(auth, text="Create a token →",
+                            bg=Palette.BG, fg=Palette.ACCENT, cursor="hand2",
+                            font=("sans-serif", 8))
+            link.pack(side="right")
+            link.bind("<Button-1>", lambda e: webbrowser.open(
+                "https://github.com/settings/tokens/new?scopes=&description=repo-freshness-checker"))
+            link.bind("<Enter>", lambda e: link.configure(font=("sans-serif", 8, "underline")))
+            link.bind("<Leave>", lambda e: link.configure(font=("sans-serif", 8)))
 
-            self.start_btn = ttk.Button(
-                cf, text="▶  Start Checking", style="Accent.TButton",
-                command=self._start)
-            self.start_btn.pack(side="left")
+            arow = ttk.Frame(main)
+            arow.pack(fill="x", pady=(6, 0))
+            self.tok_var = tk.StringVar()
+            self.tok_entry = self._field(arow)
+            self.tok_entry.pack(side="left", fill="x", expand=True, ipady=4)
+            self._show_tok = False
+            self.eye_btn = ttk.Button(arow, text="Show", width=6,
+                                      style="Ghost.TButton",
+                                      command=self._toggle_tok)
+            self.eye_btn.pack(side="left", padx=(6, 0))
+            self.remember_var = tk.BooleanVar(value=False)
+            remember = ttk.Checkbutton(
+                arow, text="Remember on this device",
+                variable=self.remember_var)
+            remember.pack(side="left", padx=(14, 0))
+            ttk.Label(
+                main, style="Caption.TLabel",
+                text="Optional — unlocks batched GraphQL checks "
+                     "(≈1 request per 100 repos) and a 5,000 req/hr budget. "
+                     "No scopes are needed for public repos."
+            ).pack(anchor="w", pady=(4, 0))
 
-            self.stop_btn = ttk.Button(
-                cf, text="⬛  Stop", style="Stop.TButton",
-                command=self._stop, state="disabled")
-            self.stop_btn.pack(side="left", padx=6)
+            # ── log ──────────────────────────────────────────
+            self._rule(main)
+            lhead = ttk.Frame(main)
+            lhead.pack(fill="x")
+            ttk.Label(lhead, text="ACTIVITY", style="Section.TLabel").pack(side="left")
 
-            self.open_btn = ttk.Button(
-                cf, text="📂 Open Report", command=self._open_report,
-                state="disabled")
-            self.open_btn.pack(side="left")
-
-            self.html_btn = ttk.Button(
-                cf, text="🌐 Export HTML", command=self._export_html,
-                state="disabled")
-            self.html_btn.pack(side="left", padx=6)
-
-            ttk.Label(cf, text="Workers:").pack(side="left", padx=(24, 2))
-            self.workers_var = tk.IntVar(value=DEFAULT_WORKERS)
-            self.workers_spin = ttk.Spinbox(
-                cf, from_=1, to=50, width=4,
-                textvariable=self.workers_var)
-            self.workers_spin.pack(side="left")
-
-            # ── Progress ──────────────────────────────────────
-            pf = ttk.Frame(main)
-            pf.pack(fill="x", **pad)
-            self.prog = ttk.Progressbar(pf, mode="determinate")
-            self.prog.pack(side="left", fill="x", expand=True)
-            self.prog_lbl = ttk.Label(pf, text="  0 / 0", width=26)
-            self.prog_lbl.pack(side="left", padx=6)
-
-            # ── Log ───────────────────────────────────────────
-            lf = ttk.LabelFrame(main, text="Log", padding=6)
-            lf.pack(fill="both", expand=True, **pad)
-
-            if sys.platform == "win32":
-                log_font = ("Consolas", 10)
-            elif sys.platform == "darwin":
-                log_font = ("Menlo", 11)
-            else:
-                log_font = ("monospace", 10)
-
+            box = tk.Frame(main, bg=Palette.BORDER, padx=1, pady=1)
+            box.pack(fill="both", expand=True, pady=(6, 0))
             self.log = scrolledtext.ScrolledText(
-                lf, height=12, state="disabled", wrap="word",
-                font=log_font,
-                bg=Palette.SURF_ALT, fg=Palette.TEXT,
-                insertbackground=Palette.TEXT,
-                relief="flat", borderwidth=0,
-                padx=6, pady=4)
+                box, height=11, state="disabled", wrap="word",
+                bg=Palette.SURF_DEEP, fg=Palette.TEXT,
+                insertbackground=Palette.TEXT, relief="flat", borderwidth=0,
+                padx=10, pady=7, highlightthickness=0)
             self.log.pack(fill="both", expand=True)
-
-            # Colour tags for log
             self.log.tag_config("ok", foreground=Palette.GREEN)
             self.log.tag_config("err", foreground=Palette.RED)
-            self.log.tag_config("info", foreground=Palette.SUBTEXT)
             self.log.tag_config("warn", foreground=Palette.YELLOW)
             self.log.tag_config("accent", foreground=Palette.ACCENT)
-            self.log.tag_config("bold", font=(log_font[0], log_font[1], "bold"))
+            self.log.tag_config("info", foreground=Palette.SUBTEXT)
+            self.log.tag_config("dim", foreground=Palette.FAINT)
 
-            # ── Status bar ────────────────────────────────────
+            # ── action bar ───────────────────────────────────
+            bar = ttk.Frame(main)
+            bar.pack(fill="x", pady=(10, 0))
+            ttk.Label(bar, text="Workers:").pack(side="left")
+            self.workers_var = tk.IntVar(value=DEFAULT_WORKERS)
+            self.workers_spin = ttk.Spinbox(bar, from_=1, to=50, width=3,
+                                            textvariable=self.workers_var)
+            self.workers_spin.pack(side="left", padx=(6, 12))
+
+            self.stop_btn = ttk.Button(bar, text="■  Stop",
+                                       style="Danger.TButton",
+                                       command=self._stop, state="disabled")
+            self.stop_btn.pack(side="right")
+            self.start_btn = ttk.Button(bar, text="Start check",
+                                        style="Accent.TButton",
+                                        command=self._start)
+            self.start_btn.pack(side="right", padx=(0, 8))
+            self.html_btn = ttk.Button(bar, text="HTML",
+                                       style="Ghost.TButton",
+                                       command=self._export_html,
+                                       state="disabled")
+            self.html_btn.pack(side="right", padx=(0, 8))
+            self.open_btn = ttk.Button(bar, text="Open report",
+                                       style="Ghost.TButton",
+                                       command=self._open_report,
+                                       state="disabled")
+            self.open_btn.pack(side="right", padx=(0, 8))
+
+            # ── status strip ─────────────────────────────────
+            status = tk.Frame(main, bg=Palette.SURFACE)
+            status.pack(fill="x", pady=(10, 0))
             self.status_var = tk.StringVar(value="Ready")
-            status_bar = ttk.Label(main, textvariable=self.status_var,
-                                   style="Status.TLabel")
-            status_bar.pack(fill="x", **pad)
+            self.status_lbl = tk.Label(status, textvariable=self.status_var,
+                                       bg=Palette.SURFACE, fg=Palette.SUBTEXT,
+                                       font=("sans-serif", 9), anchor="w")
+            self.status_lbl.pack(side="left", padx=(10, 10), pady=5)
+            self.prog = ttk.Progressbar(status, mode="determinate")
+            self.prog.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=7)
+            self.prog_lbl = tk.Label(status, text="0 / 0", bg=Palette.SURFACE,
+                                     fg=Palette.SUBTEXT,
+                                     font=("sans-serif", 9), width=22,
+                                     anchor="e", padx=0)
+            self.prog_lbl.pack(side="left", padx=(0, 10))
 
-        # ── drag & drop ──────────────────────────────────────
+        def _rule(self, parent):
+            line = tk.Frame(parent, bg=Palette.BORDER, height=1)
+            line.pack(fill="x", pady=(12, 10))
+
+        # ── drag & drop / paste ──────────────────────────────
         def _setup_drag_drop(self):
             try:
-                self.in_entry.drop_target_register("*")
+                self.in_entry.drop_target_register("DND_Files")
                 self.in_entry.dnd_bind("<<Drop>>", self._on_drop)
-                self.in_entry.master.drop_target_register("*")
-                self.in_entry.master.dnd_bind("<<Drop>>", self._on_drop)
-            except (AttributeError, tk.TclError):
-                self.in_entry.bind("<Button-3>", self._paste_context_menu)
-                self.in_entry.bind("<<Paste>>", self._on_paste)
+                self.tok_entry.drop_target_register("DND_Files")
+                self.tok_entry.dnd_bind("<<Drop>>", self._on_drop)
+            except Exception:
+                pass
+            for w in (self.in_entry, self.out_entry):
+                w.bind("<Button-3>", self._paste_context_menu)
+
+        @staticmethod
+        def _paths_from_text(raw: str) -> list[str]:
+            from urllib.parse import unquote
+            raw = raw.strip()
+            if not raw:
+                return []
+            if raw.startswith("file://"):
+                raw = raw[len("file://"):]
+            if "{" in raw:
+                # Tk DnD-style list: {path one} {path two}
+                parts = re.findall(r"\{[^{}]*\}", raw)
+            else:
+                parts = raw.splitlines() if "\n" in raw or "\r" in raw else [raw]
+            out = []
+            for p in parts:
+                p = p.strip("{}").strip()
+                p = unquote(p)
+                if p:
+                    out.append(p)
+            return out
 
         def _on_drop(self, event):
-            raw = getattr(event, "data", "")
-            if not raw:
+            if getattr(event, "widget", None) not in (None, self.in_entry):
                 return
-            path = raw.strip("{}").strip()
-            if path.startswith("file://"):
-                path = path[7:]
-            if path.startswith("file:"):
-                path = path[5:]
-            from urllib.parse import unquote
-            path = unquote(path)
-            if Path(path).is_dir():
-                self.input_files = find_markdown_files(path)
-                self._update_input_display()
-            elif Path(path).is_file():
-                self.input_files = [str(Path(path).resolve())]
+            paths = self._paths_from_text(getattr(event, "data", ""))
+            found = False
+            for p in paths:
+                path = Path(p)
+                if path.is_dir():
+                    self.input_files.extend(find_markdown_files(path))
+                    found = True
+                elif path.is_file():
+                    self.input_files.append(str(path.resolve()))
+                    found = True
+            if found:
                 self._update_input_display()
 
-        def _on_paste(self, event=None):
-            self.after(10, self._check_clipboard_for_path)
+        def _check_clipboard_for_path(self):
+            try:
+                raw = self.clipboard_get().strip().strip("'\"")
+                paths = self._paths_from_text(raw)
+            except (tk.TclError, OSError):
+                return
+            for p in paths:
+                path = Path(p)
+                if path.is_dir():
+                    self.input_files.extend(find_markdown_files(path))
+                elif path.is_file():
+                    self.input_files.append(str(path.resolve()))
+            if paths:
+                self._update_input_display()
 
         def _paste_context_menu(self, event):
             menu = tk.Menu(self, tearoff=0, bg=Palette.SURFACE,
                            fg=Palette.TEXT, activebackground=Palette.ACCENT,
-                           activeforeground=Palette.BG)
-            menu.add_command(label="Paste path",
+                           activeforeground=Palette.ONACCENT)
+            menu.add_command(label="Paste path from clipboard",
                              command=self._check_clipboard_for_path)
-            menu.add_command(label="Browse…", command=self._browse_in)
-            menu.tk_popup(event.x_root, event.y_root)
-
-        def _check_clipboard_for_path(self):
+            if event.widget is self.in_entry:
+                menu.add_command(label="Choose folder…",
+                                 command=self._browse_in)
+                menu.add_separator()
+                menu.add_command(label="Clear input", command=self._clear_input)
+            else:
+                menu.add_command(label="Choose output file…",
+                                 command=self._browse_out)
             try:
-                raw = self.clipboard_get().strip()
-                path = raw.strip("'\"").strip()
-                if path.startswith("file://"):
-                    path = path[7:]
-                if Path(path).is_dir():
-                    self.input_files = find_markdown_files(path)
-                    self._update_input_display()
-                elif Path(path).is_file():
-                    self.input_files = [str(Path(path).resolve())]
-                    self._update_input_display()
-            except (tk.TclError, OSError):
-                pass
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
 
-        # ── config persistence ────────────────────────────────
-        CONFIG_FILE = CONFIG_DIR / "gui_config.json"
+        def _clear_input(self):
+            self.input_files = []
+            self.in_var.set("")
+            self._update_input_display()
 
-        def _load_config(self):
-            try:
-                if self.CONFIG_FILE.exists():
-                    data = json.loads(self.CONFIG_FILE.read_text())
-                    if "last_input" in data:
-                        saved = data["last_input"]
-                        if isinstance(saved, str):
-                            saved = [saved]
-                        self.input_files = []
-                        for p in saved:
-                            if Path(p).is_dir():
-                                self.input_files.extend(find_markdown_files(p))
-                            elif Path(p).is_file():
-                                self.input_files.append(str(Path(p)))
-                        self._update_input_display()
-                    if "last_output" in data:
-                        self.out_var.set(data["last_output"])
-                    if "last_workers" in data:
-                        self.workers_var.set(data["last_workers"])
-            except (json.JSONDecodeError, OSError):
-                pass
-
-        def _save_config(self):
-            try:
-                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-                data = {
-                    "last_input": self.input_files,
-                    "last_output": self.out_var.get(),
-                    "last_workers": self.workers_var.get(),
-                }
-                self.CONFIG_FILE.write_text(
-                    json.dumps(data, indent=2), encoding="utf-8")
-            except OSError:
-                pass
-
-        # ── callbacks ─────────────────────────────────────────
-        def _toggle_tok(self):
-            self._show_tok = not self._show_tok
-            self.tok_entry.config(show="" if self._show_tok else "●")
-            self.eye_btn.config(text="Hide" if self._show_tok else "Show")
-
-        def _save_tok(self):
-            t = self.tok_var.get().strip()
-            if not t:
-                messagebox.showwarning("Token", "Enter a token first.")
-                return
-            # Validate token format before saving
-            is_valid, msg = validate_token(t)
-            if not is_valid:
-                if not messagebox.askyesno("Token Warning",
-                        f"{msg}.\n\nSave anyway?"):
-                    return
-            save_token(t)
-            messagebox.showinfo("Token Saved",
-                f"Token saved securely.\n"
-                f"Location: {TOKEN_FILE}\n\n"
-                "Note: Token is stored in plaintext.\n"
-                "Use 'Clear' to remove it from disk when done.")
-
-        def _clear_tok(self):
-            self.tok_var.set("")
-            clear_saved_token()
-
+        # ── input / output resolution ────────────────────────
         def _browse_in(self):
-            folder = filedialog.askdirectory(title="Select folder containing Markdown files")
+            folder = filedialog.askdirectory(
+                title="Select folder containing Markdown files")
             if folder:
-                self.input_files = find_markdown_files(folder)
-                if not self.input_files:
+                found = find_markdown_files(folder)
+                if not found:
                     messagebox.showwarning(
                         "No Markdown files",
                         "The selected folder contains no Markdown files.",
                     )
+                    return
+                self.input_files = found
                 self._update_input_display()
 
         def _update_input_display(self):
             if len(self.input_files) == 1:
                 self.in_var.set(self.input_files[0])
+                self.src_hint.config(text="1 file")
             elif self.input_files:
-                self.in_var.set(f"{len(self.input_files)} Markdown files found")
-            else:
                 self.in_var.set("")
+                self.src_hint.config(
+                    text=f"{len(self.input_files)} Markdown files ready to scan")
+            else:
+                self.src_hint.config(
+                    text="Markdown files or a folder containing them")
 
         def _browse_out(self):
             p = filedialog.asksaveasfilename(
-                title="Save report as",
-                defaultextension=".md",
-                filetypes=[("Markdown", "*.md")])
+                title="Save report as", defaultextension=".md",
+                initialfile=self.out_var.get() or "freshness_report.md",
+                filetypes=[("Markdown report", "*.md"),
+                           ("HTML report", "*.html")])
             if p:
                 self.out_var.set(p)
 
-        def _open_report(self):
-            p = self.out_var.get()
-            if not Path(p).exists():
-                return
-            import subprocess, platform
-            s = platform.system()
-            if s == "Darwin":
-                subprocess.Popen(["open", p])
-            elif s == "Windows":
-                os.startfile(p)
-            else:
-                subprocess.Popen(["xdg-open", p])
+        def _resolve_inputs(self) -> tuple[list[str], str]:
+            """(input files, error message or '')."""
+            if self.input_files:
+                return self.input_files, ""
+            typed = self.in_var.get().strip()
+            if not typed:
+                return [], "Choose or drop the files that list the repositories."
+            p = Path(typed)
+            if p.is_dir():
+                found = find_markdown_files(p)
+                if not found:
+                    return [], f"No Markdown files found in “{typed}”."
+                return found, ""
+            if p.is_file():
+                return [str(p.resolve())], ""
+            return [], f"Path not found: “{typed}”."
 
-        def _export_html(self):
-            """Open the companion HTML report (auto-generated alongside .md)."""
-            md_path = self.out_var.get()
-            html_path = str(Path(md_path).with_suffix('.html'))
-            if not Path(html_path).exists():
-                # Regenerate from stored data if available
-                results = getattr(self, 'last_results', None)
-                errors = getattr(self, 'last_errors', None)
-                if results is not None and errors is not None:
-                    generate_html_report(results, errors, html_path)
-                else:
-                    messagebox.showerror("Error", "No report data available. Run a check first.")
-                    return
-            import subprocess, platform
-            s = platform.system()
-            if s == "Darwin":
-                subprocess.Popen(["open", html_path])
-            elif s == "Windows":
-                os.startfile(html_path)
-            else:
-                subprocess.Popen(["xdg-open", html_path])
+        # ── token actions ────────────────────────────────────
+        def _toggle_tok(self):
+            self._show_tok = not self._show_tok
+            self.tok_entry.config(show="" if self._show_tok else "●")
+            self.eye_btn.config(text="Hide" if self._show_tok else "Show")
 
-        def _log(self, msg: str):
-            """Log with automatic tag detection based on emoji prefixes."""
-            msg = self._sanitize(msg)
-            self.log.config(state="normal")
-            # Determine tag from message prefix
-            tag = None
-            if msg.startswith("✅") or msg.startswith("📝"):
-                tag = "ok"
-            elif msg.startswith("❌") or msg.startswith("💥"):
-                tag = "err"
-            elif msg.startswith("⏳") or msg.startswith("⚠"):
-                tag = "warn"
-            elif msg.startswith("🔑") or msg.startswith("⚙"):
-                tag = "accent"
-            elif msg.startswith("["):
-                # Line like "[1/523] ✅ ..."
-                tag = "info"
-            if tag:
-                self.log.insert("end", msg + "\n", tag)
-            else:
-                self.log.insert("end", msg + "\n")
-            self.log.see("end")
-            self.log.config(state="disabled")
-
-        def _progress(self, cur, total, dyn_info=None):
-            pct = cur / total * 100 if total else 0
-            self.prog["value"] = pct
-            label = f"  {cur} / {total}  ({pct:.1f}%)"
-            if dyn_info and dyn_info.get("eta", 0) > 0:
-                eta = dyn_info["eta"]
-                if eta >= 3600:
-                    label += f"  ⏱ ETA: {eta/3600:.1f}h"
-                elif eta >= 60:
-                    label += f"  ⏱ ETA: {eta/60:.0f}m"
-                else:
-                    label += f"  ⏱ ETA: {eta:.0f}s"
-            self.prog_lbl.config(text=label)
-
-        # ── threaded work ─────────────────────────────────────
-        def _start(self):
-            inp = list(self.input_files)
-            if not inp:
-                typed_input = self.in_var.get().strip()
-                if typed_input:
-                    inp = [typed_input]
-            out = self.out_var.get().strip()
+        def _resolve_token(self) -> tuple[str, str]:
+            """(token, error message or '')."""
             tok = self.tok_var.get().strip()
-            if not inp or any(not Path(path).is_file() for path in inp):
-                messagebox.showerror("Error", "Select valid input files or a folder containing Markdown files.")
-                return
-            if not out:
-                messagebox.showerror("Error", "Specify an output file.")
-                return
             if not tok:
-                if not messagebox.askyesno(
-                    "No token",
-                    "Without a token the rate limit is 60 req/hr.\n"
-                    "For 500+ repos this will take hours.\n\nContinue anyway?"
-                ):
+                tok = load_token()
+                if tok:
+                    self.tok_var.set(tok)
+                    self.remember_var.set(True)
+            if tok:
+                is_valid, msg = validate_token(tok)
+                if not is_valid:
+                    return "", f"{msg}\n\nYou can still continue — paste a valid token, or run without one (60 req/hr)."
+            return tok, ""
+
+        # ── run lifecycle ────────────────────────────────────
+        def _start(self):
+            if self.running:
+                return
+            inp, err = self._resolve_inputs()
+            if err:
+                messagebox.showerror("Input", err)
+                return
+            out = self.out_var.get().strip()
+            if not out:
+                messagebox.showerror("Output", "Choose a file to save the report to.")
+                return
+            tok, tok_err = self._resolve_token()
+            if tok_err:
+                if messagebox.askyesno("Token looks invalid", tok_err):
+                    tok = ""   # run unauthenticated instead
+                else:
                     return
+            elif not tok and not messagebox.askyesno(
+                    "Continue without a token?",
+                    "GitHub allows only 60 requests/hour without one, so "
+                    "checking large lists can take a long time. A token "
+                    "also enables batched GraphQL checks.\n\n"
+                    "Continue without a token?"):
+                return
+
+            # token persistence follows the checkbox
+            try:
+                if tok:
+                    if self.remember_var.get():
+                        save_token(tok)
+                    else:
+                        clear_saved_token()
+            except OSError as exc:
+                messagebox.showwarning("Token", f"Could not save the token:\n{exc}")
 
             self.running = True
             self.cancel_event.clear()
@@ -1626,10 +1772,10 @@ def run_gui():
             self.stop_btn.config(state="normal")
             self.open_btn.config(state="disabled")
             self.html_btn.config(state="disabled")
-            self.log.config(state="normal")
-            self.log.delete("1.0", "end")
-            self.log.config(state="disabled")
-            self.status_var.set("Extracting URLs …")
+            self.workers_spin.config(state="disabled")
+            self.prog["value"] = 0
+            self._log_clear()
+            self._status("Extracting repository URLs…", Palette.SUBTEXT)
 
             t = threading.Thread(target=self._worker,
                                  args=(inp, out, tok), daemon=True)
@@ -1638,21 +1784,22 @@ def run_gui():
         def _stop(self):
             self.cancel_event.set()
             self.stop_btn.config(state="disabled")
-            self.status_var.set("Cancelling …")
+            self._status("Stopping — waiting for the current request…",
+                         Palette.YELLOW)
 
         def _worker(self, inp, out, tok):
             try:
-                self._safe_log(f"📂 Reading {len(inp)} input file(s) …")
+                self._safe_log(f"Reading {len(inp)} input file(s)…", "info")
                 repos = extract_repos(expand_input_paths(inp))
-                self._safe_log(f"🔍 Found {len(repos)} unique GitHub repos")
+                self._safe_log(f"Found {len(repos)} unique repositories", "accent")
                 if not repos:
-                    self._safe_status("No repos found.")
+                    self._safe_status("No repositories found in the input.")
                     self._finish()
                     return
 
                 workers = self.workers_var.get()
-                self._safe_log(f"⚙  Using {workers} concurrent workers")
-                self._safe_status("Checking repos …")
+                self._safe_log(f"Workers: {workers}", "dim")
+                self._safe_status("Checking repositories…", Palette.SUBTEXT)
                 results, errors = process_repos(
                     repos, tok,
                     progress_cb=self._safe_progress,
@@ -1661,27 +1808,34 @@ def run_gui():
                     max_workers=workers,
                 )
 
-                # Store for HTML export
-                self.after(0, lambda: setattr(self, 'last_results', results))
-                self.after(0, lambda: setattr(self, 'last_errors', errors))
+                self.after(0, lambda: setattr(self, "last_results", results))
+                self.after(0, lambda: setattr(self, "last_errors", errors))
 
+                stopped = self.cancel_event.is_set()
                 if results or errors:
                     generate_report(results, errors, out)
-                    # Also generate HTML companion file alongside the .md
-                    html_path = str(Path(out).with_suffix('.html'))
+                    html_path = str(Path(out).with_suffix(".html"))
                     generate_html_report(results, errors, html_path)
-                    self._safe_log(f"\n📝 Report saved → {out}")
-                    self._safe_log(f"🌐 HTML report → {html_path}")
-                    self._safe_log(
-                        f"   ✅ {len(results)} repos  |  ❌ {len(errors)} errors")
-                    self._safe_status(f"Done - report saved to {out}")
+                    self._safe_log("", "dim")
+                    if stopped:
+                        self._safe_log("Stopped by user — writing partial "
+                                       "results…", "warn")
+                    self._safe_log(f"Markdown report → {out}", "ok")
+                    self._safe_log(f"HTML report     → {html_path}", "ok")
+                    self._safe_log(f"{len(results)} checked  ·  "
+                                   f"{len(errors)} errors", "dim")
+                    if stopped:
+                        self._safe_status("Stopped — partial results saved",
+                                          Palette.YELLOW)
+                    else:
+                        self._safe_status("Done — report saved", Palette.GREEN)
                     self.after(0, lambda: self.open_btn.config(state="normal"))
                     self.after(0, lambda: self.html_btn.config(state="normal"))
                 else:
-                    self._safe_status("Nothing to report.")
+                    self._safe_status("Nothing to report.", Palette.YELLOW)
             except Exception as exc:
-                self._safe_log(f"\n💥 ERROR: {exc}")
-                self._safe_status(f"Error: {exc}")
+                self._safe_log(f"Unexpected error: {exc}", "err")
+                self._safe_status("Failed — see activity log", Palette.RED)
             finally:
                 self._finish()
                 self.after(0, self._save_config)
@@ -1690,26 +1844,153 @@ def run_gui():
             self.running = False
             self.after(0, lambda: self.start_btn.config(state="normal"))
             self.after(0, lambda: self.stop_btn.config(state="disabled"))
+            self.after(0, lambda: self.workers_spin.config(state="normal"))
+
+        # ── report actions ───────────────────────────────────
+        def _open_path(self, path: str):
+            import subprocess, platform
+            if not Path(path).exists():
+                return False
+            s = platform.system()
+            try:
+                if s == "Darwin":
+                    subprocess.Popen(["open", path])
+                elif s == "Windows":
+                    os.startfile(path)
+                else:
+                    subprocess.Popen(["xdg-open", path])
+            except OSError:
+                return False
+            return True
+
+        def _open_report(self):
+            p = self.out_var.get().strip()
+            if p and not self._open_path(p):
+                messagebox.showerror("Open",
+                                     "The report does not exist yet — run a check first.")
+            elif not p:
+                messagebox.showerror("Open", "Choose an output path first.")
+
+        def _export_html(self):
+            md_path = self.out_var.get().strip()
+            html_path = str(Path(md_path or "freshness_report.md").with_suffix(".html"))
+            if not Path(html_path).exists():
+                results = getattr(self, "last_results", None)
+                errors = getattr(self, "last_errors", None)
+                if results is None or errors is None:
+                    messagebox.showerror(
+                        "Export", "No report data available — run a check first.")
+                    return
+                try:
+                    generate_html_report(results, errors, html_path)
+                except OSError as exc:
+                    messagebox.showerror("Export", f"Could not write the file:\n{exc}")
+                    return
+            if not self._open_path(html_path):
+                messagebox.showerror("Export",
+                                     f"The HTML report was written to:\n{html_path}")
+
+        # ── logging / progress ───────────────────────────────
+        def _log_clear(self):
+            self.log.config(state="normal")
+            self.log.delete("1.0", "end")
+            self.log.config(state="disabled")
 
         def _sanitize(self, text: str) -> str:
-            """Redact token from any displayed text to prevent accidental leaks."""
             token = self.tok_var.get().strip()
             if token and token in text:
                 text = text.replace(token, "***")
             return text
 
-        # thread-safe helpers
-        def _safe_log(self, msg):
-            self.after(0, self._log, msg)
+        def _log(self, msg: str, tag: str | None = None):
+            msg = self._sanitize(msg)
+            self.log.config(state="normal")
+            if msg:
+                if msg.startswith("✅") or msg.startswith("📝") or msg.startswith("🌐"):
+                    tag = "ok"
+                elif msg.startswith("❌") or msg.startswith("💥"):
+                    tag = "err"
+                elif msg.startswith("⏳") or msg.startswith("⚠"):
+                    tag = "warn"
+                elif msg.startswith("🔑") or msg.startswith("⚙"):
+                    tag = "accent"
+                elif msg.startswith("["):
+                    tag = tag or "info"
+            self.log.insert("end", msg + "\n" if msg else "\n",
+                             tag or "info")
+            self.log.see("end")
+            self.log.config(state="disabled")
+            if tag == "err":
+                self._status("Error — see activity log", Palette.RED)
+
+        def _status(self, text: str, color: str | None = None):
+            self.status_var.set(self._sanitize(text))
+            self.status_lbl.config(fg=color or Palette.SUBTEXT)
+
+        def _progress(self, cur, total, dyn_info=None):
+            pct = cur / total * 100 if total else 0
+            self.prog["value"] = pct
+            label = f"{cur} / {total}"
+            if dyn_info and dyn_info.get("eta", 0) > 0:
+                eta = dyn_info["eta"]
+                if eta >= 3600:
+                    label += f"  ·  ETA {eta / 3600:.1f}h"
+                elif eta >= 60:
+                    label += f"  ·  ETA {eta / 60:.0f}m"
+                else:
+                    label += f"  ·  ETA {eta:.0f}s"
+            self.prog_lbl.config(text=label)
+
+        # thread-safe marshalling
+        def _safe_log(self, msg, tag=None):
+            self.after(0, lambda m=msg, t=tag: self._log(m, t))
 
         def _safe_progress(self, cur, total, dyn_info=None):
-            self.after(0, self._progress, cur, total, dyn_info)
+            self.after(0, lambda: self._progress(cur, total, dyn_info))
 
-        def _safe_status(self, msg):
-            self.after(0, lambda m=msg: self.status_var.set(self._sanitize(m)))
+        def _safe_status(self, msg, color=None):
+            self.after(0, lambda: self._status(msg, color))
+
+        # ── config persistence ───────────────────────────────
+        def _load_config(self):
+            try:
+                if not self.CONFIG_FILE.exists():
+                    return
+                data = json.loads(self.CONFIG_FILE.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                return
+            saved_in = data.get("last_input", "")
+            if isinstance(saved_in, list) and saved_in:
+                alive = [s for s in saved_in if Path(s).is_file()]
+                self.input_files = alive
+                self._update_input_display()
+            elif isinstance(saved_in, str) and saved_in:
+                self.in_var.set(saved_in)
+            if data.get("last_output"):
+                self.out_var.set(data["last_output"])
+            try:
+                if data.get("last_workers"):
+                    self.workers_var.set(int(data["last_workers"]))
+            except (TypeError, ValueError):
+                pass
+
+        def _save_config(self):
+            try:
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                data = {
+                    "last_input": list(self.input_files)
+                                  or [self.in_var.get().strip()],
+                    "last_output": self.out_var.get().strip(),
+                    "last_workers": self.workers_var.get(),
+                }
+                self.CONFIG_FILE.write_text(json.dumps(data, indent=2),
+                                            encoding="utf-8")
+            except OSError:
+                pass
 
     app = App()
     app.mainloop()
+
 
 # ═══════════════════════════ CLI ════════════════════════════════
 def run_cli():

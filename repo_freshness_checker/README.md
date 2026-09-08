@@ -9,6 +9,15 @@ only ~5 requests and a fraction of the rate-limit budget); it automatically fall
 requests when GraphQL is unavailable or a batch keeps failing (rate limits, timeouts), so results are identical
 either way. Secondary rate limits (`Retry-After`) are honoured instead of being reported as errors.
 
+The generated **HTML report** is a single self-contained file (no external assets) with light/dark themes, a
+summary card row, clickable status filter chips with counts, instant search, sortable columns (oldest first by
+default), CSV export of the visible rows, and a collapsible errors section. Keyboard: `/` focuses search,
+`Esc` clears it.
+
+The **GUI** is a flat, native-toolkit interface (no webview): source/report fields with live hints, token field
+with show/hide and optional on-device remembering, drag & drop or clipboard paste of folders/files, per-run
+worker control, an activity log with colour-coded lines, and an inline progress/ETA status bar.
+
 Supports both a graphical interface and command-line mode.
 
 ### Requirements
