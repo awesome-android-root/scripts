@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-GitHub Repo Freshness Checker v2.2
+GitHub Repo Freshness Checker v2.4
 ===================================
 Reads a file containing GitHub URLs, checks last-update dates via the
-GitHub API, and writes a sorted Markdown report.  Uses parallel API
-requests (ThreadPoolExecutor) for drastically faster checking.
+GitHub API, and writes a sorted Markdown report.  With a token it uses
+GraphQL batch queries (up to 100 repos per request) for drastically
+faster checking; without one it falls back to parallel REST requests
+(ThreadPoolExecutor), so results stay identical either way.
 
   GUI mode : python repo_freshness_checker.py
   CLI mode : python repo_freshness_checker.py README.md -o report.md -t ghp_xxxx
@@ -24,13 +26,15 @@ except ImportError:
     sys.exit(1)
 
 # ──────────────────────────── config ────────────────────────────
-VERSION           = "2.3.0"
+VERSION           = "2.4.0"
 CONFIG_DIR        = Path.home() / ".repo-freshness-checker"
 TOKEN_FILE        = CONFIG_DIR / "token"
 API_BASE          = "https://api.github.com"
 DEFAULT_WORKERS   = 15       # concurrent API requests
 REQUEST_TIMEOUT   = 15       # seconds per request
 MAX_RETRIES       = 2        # max retries on rate-limit
+GRAPHQL_BATCH_SIZE = 100     # repos per GraphQL request (~1 rate-limit point)
+GRAPHQL_CONCURRENCY = 4      # max parallel GraphQL requests (each is already large)
 
 # ──────────────────────── token helpers ─────────────────────────
 def save_token(token: str):
@@ -131,10 +135,13 @@ def expand_input_paths(paths: list[str]) -> list[str]:
     return expanded
 
 # ──────────────────── GitHub API layer ──────────────────────────
-def _session(token: str) -> _requests.Session:
+def _session(token: str, *, graphql: bool = False) -> _requests.Session:
     s = _requests.Session()
     s.headers.update({
-        "Accept": "application/vnd.github.v3+json",
+        # REST uses the versioned media type; the GraphQL endpoint just
+        # returns JSON regardless.
+        "Accept": "application/vnd.github.v3+json" if not graphql
+                  else "application/json",
         "User-Agent": f"RepoFreshnessChecker/{VERSION}",
     })
     if token:
@@ -153,8 +160,31 @@ def verify_auth(session: _requests.Session) -> dict | None:
         "reset_ts": c["reset"],
     }
 
+def _int_header(headers, name: str) -> int:
+    """Parse an integer response header; 0 when missing / unparseable."""
+    try:
+        return int(headers.get(name) or 0)
+    except ValueError:
+        return 0
+
+def _retry_after_seconds(headers) -> float | None:
+    """GitHub sends 'Retry-After' (in seconds) when a secondary rate limit /
+    abuse-detection limit is hit. Returns None when the header is absent."""
+    raw = headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 60.0
+
 def fetch_repo(session: _requests.Session, owner: str, repo: str) -> dict:
-    """Fetch a single repo's info. Returns a dict with consistent keys."""
+    """Fetch a single repo's info via the REST API (1 request per repo).
+
+    Returns a dict with consistent keys. Rate-limited responses carry
+    rate_limited=True plus either reset_ts (primary limit; epoch seconds)
+    or retry_after (secondary limit; seconds to back off).
+    """
     try:
         r = session.get(
             f"{API_BASE}/repos/{owner}/{repo}",
@@ -176,17 +206,25 @@ def fetch_repo(session: _requests.Session, owner: str, repo: str) -> dict:
             return {"ok": False, "error": "Not found (deleted / private)"}
         if r.status_code == 451:
             return {"ok": False, "error": "Unavailable (DMCA / legal)"}
-        if r.status_code == 403:
-            rem = r.headers.get("X-RateLimit-Remaining", "?")
-            if rem == "0":
-                reset = int(r.headers.get("X-RateLimit-Reset", 0))
-                return {"ok": False, "error": "Rate-limited",
+        if r.status_code in (403, 429):
+            # Secondary rate limit / abuse detection: GitHub answers with a
+            # Retry-After header telling us when we may try again - that must
+            # be retried, not reported as a hard "Forbidden" error.
+            retry_after = _retry_after_seconds(r.headers)
+            if retry_after is not None:
+                return {"ok": False, "error": "Secondary rate limit",
+                        "rate_limited": True, "retry_after": retry_after}
+            # Primary rate limit exhausted
+            if r.status_code == 429 or \
+                    r.headers.get("X-RateLimit-Remaining", "?") == "0":
+                reset = _int_header(r.headers, "X-RateLimit-Reset")
+                if not reset:
+                    reset = int(time.time() + 60)
+                label = "Rate-limited (429)" if r.status_code == 429 \
+                    else "Rate-limited"
+                return {"ok": False, "error": label,
                         "rate_limited": True, "reset_ts": reset}
             return {"ok": False, "error": "Forbidden (403)"}
-        if r.status_code == 429:
-            reset = int(r.headers.get("X-RateLimit-Reset", time.time() + 60))
-            return {"ok": False, "error": "Rate-limited (429)",
-                    "rate_limited": True, "reset_ts": reset}
         return {"ok": False, "error": f"HTTP {r.status_code}"}
     except _requests.exceptions.Timeout:
         return {"ok": False, "error": "Timeout"}
@@ -194,6 +232,166 @@ def fetch_repo(session: _requests.Session, owner: str, repo: str) -> dict:
         return {"ok": False, "error": "Connection error"}
     except _requests.exceptions.RequestException as e:
         return {"ok": False, "error": f"Request failed: {e}"}
+
+# ──────────────────── GraphQL batch layer ───────────────────────
+def _graphql_usable(session: _requests.Session) -> bool:
+    """True when the GraphQL API answers for this session/token.
+
+    Probe is a single rateLimit query (~0 points; also served while the
+    primary limit is exhausted). One retry covers transient failures.
+    """
+    query = "query { rateLimit { limit remaining resetAt } }"
+    for _ in range(2):
+        try:
+            r = session.post(f"{API_BASE}/graphql", json={"query": query},
+                             timeout=REQUEST_TIMEOUT)
+        except _requests.exceptions.RequestException:
+            r = None
+        if r is not None and r.status_code == 200:
+            try:
+                payload = r.json()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+                return True
+        time.sleep(1.0)
+    return False
+
+def build_graphql_query(repos_batch: list[tuple[str, str]]) -> str:
+    """One query with one aliased repository(owner, name) lookup per repo,
+    so a whole batch of repos costs a single HTTP request (~1 point)."""
+    parts = []
+    for i, (owner, repo) in enumerate(repos_batch):
+        parts.append(
+            f'r{i}: repository(owner: {json.dumps(owner)}, '
+            f'name: {json.dumps(repo)}) {{ '
+            f'pushedAt isArchived stargazerCount description }}'
+        )
+    return "query {\n" + "\n".join(parts) + "\n}"
+
+_ALIAS_FORBIDDEN_TYPES = frozenset(
+    ("FORBIDDEN", "RESOURCE_NOT_ACCESSIBLE", "INSUFFICIENT_SCOPES")
+)
+
+def _alias_error_message(err, owner: str, repo: str) -> str:
+    """Human-readable message for one alias-level GraphQL error."""
+    if not isinstance(err, dict):
+        return "GraphQL error"
+    typ = err.get("type") or ""
+    if typ == "NOT_FOUND":
+        return "Not found (deleted / private)"
+    if typ in _ALIAS_FORBIDDEN_TYPES:
+        return "Forbidden (private / access denied)"
+    msg = str(err.get("message") or "").strip()
+    return (msg[:200] if msg else "GraphQL error")
+
+def fetch_graphql_batch(
+    session: _requests.Session,
+    repos_batch: list[tuple[str, str]],
+) -> tuple[list[dict] | None, dict | None]:
+    """Fetch *repos_batch* (up to GRAPHQL_BATCH_SIZE repos) in ONE request.
+
+    Returns (infos, batch_err):
+      * success → (list of per-repo info dicts parallel to repos_batch, None).
+        Alias-level errors (deleted/private repos, etc.) become per-repo
+        error dicts - the rest of the batch is unaffected.
+      * failure → (None, {error, ...}) with retry hints: rate_limited +
+        reset_ts (primary limit), retry_after seconds (secondary limit), or
+        immediate_rest (don't retry the batch - fall back to REST instead).
+    """
+    try:
+        r = session.post(
+            f"{API_BASE}/graphql",
+            json={"query": build_graphql_query(repos_batch)},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except _requests.exceptions.Timeout:
+        return None, {"error": "Timeout", "immediate_rest": True}
+    except _requests.exceptions.ConnectionError:
+        return None, {"error": "Connection error", "immediate_rest": True}
+    except _requests.exceptions.RequestException as e:
+        return None, {"error": f"Request failed: {e}", "immediate_rest": True}
+
+    code = r.status_code
+    if code == 401:
+        return None, {"error": "Authentication failed (HTTP 401)",
+                      "immediate_rest": True}
+    if code in (502, 504):
+        # GitHub kills requests exceeding its ~10s processing budget
+        return None, {"error": f"Server timeout (HTTP {code})",
+                      "immediate_rest": True}
+
+    # Secondary rate limit / abuse detection (GitHub: HTTP 200 or 403 with a
+    # Retry-After header, or an error message mentioning the secondary limit)
+    retry_after = _retry_after_seconds(r.headers)
+    if code in (403, 429) and retry_after is not None:
+        return None, {"error": "Secondary rate limit", "retry_after": retry_after}
+    if code == 403:
+        if r.headers.get("X-RateLimit-Remaining") == "0":
+            return None, {"error": "Rate-limited", "rate_limited": True,
+                          "reset_ts": _int_header(r.headers, "X-RateLimit-Reset")
+                                     or int(time.time() + 60)}
+        return None, {"error": "Forbidden (403)"}
+    if code == 429:
+        return None, {"error": "Rate-limited (429)", "rate_limited": True,
+                      "reset_ts": _int_header(r.headers, "X-RateLimit-Reset")
+                                 or int(time.time() + 60)}
+    if code != 200:
+        return None, {"error": f"HTTP {code}"}
+
+    try:
+        payload = r.json()
+    except ValueError:
+        return None, {"error": "Invalid JSON response", "immediate_rest": True}
+    if not isinstance(payload, dict):
+        return None, {"error": "Invalid response payload", "immediate_rest": True}
+
+    errors = payload.get("errors") or []
+    data = payload.get("data")
+
+    if isinstance(data, dict):
+        infos: list[dict] = []
+        for i, (owner, repo) in enumerate(repos_batch):
+            node = data.get(f"r{i}")
+            if isinstance(node, dict):
+                pa = node.get("pushedAt")
+                infos.append({
+                    "ok": True,
+                    "pushed_at": datetime.strptime(
+                        pa, "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=timezone.utc) if pa else None,
+                    "archived": bool(node.get("isArchived", False)),
+                    "stars": int(node.get("stargazerCount") or 0),
+                    "description": node.get("description") or "",
+                })
+            else:
+                alias_err = next(
+                    (e for e in errors
+                     if isinstance(e, dict) and e.get("path") == [f"r{i}"]),
+                    None,
+                )
+                infos.append({"ok": False,
+                              "error": _alias_error_message(
+                                  alias_err, owner, repo)})
+        return infos, None
+
+    # Whole request failed (data == null)
+    if any(isinstance(e, dict) and e.get("type") == "RATE_LIMITED"
+           for e in errors):
+        # GraphQL reports primary rate-limit exhaustion as HTTP 200 + an
+        # error; the reset time comes from the response headers
+        return None, {"error": "Rate-limited", "rate_limited": True,
+                      "reset_ts": _int_header(r.headers, "X-RateLimit-Reset")
+                                 or int(time.time() + 60)}
+    if any(isinstance(e, dict)
+           and "secondary rate limit" in str(e.get("message", "")).lower()
+           for e in errors):
+        return None, {"error": "Secondary rate limit", "retry_after": 60.0}
+    msg = next((str(e["message"])[:200] for e in errors
+                if isinstance(e, dict) and e.get("message")), "")
+    return None, {"error": f"GraphQL error: {msg}" if msg
+                  else "GraphQL request error",
+                  "immediate_rest": True}
 
 # ──────────────────── processing loop ───────────────────────────
 def process_repos(
@@ -205,8 +403,15 @@ def process_repos(
     max_workers: int = DEFAULT_WORKERS,
 ) -> tuple[list[dict], list[dict]]:
     """
-    Check all repos using a thread pool for parallel API requests.
-    Returns (results, errors).
+    Check all repos and return (results, errors).
+
+    With a token the tool fetches through the GraphQL API, where
+    GRAPHQL_BATCH_SIZE repos are looked up per single request (~1 point) -
+    a 500-repo list drops from 500 requests to ~5 and only needs a fraction
+    of the rate-limit budget. When GraphQL is unavailable (no token, or the
+    API rejects it) it falls back to one REST request per repo, parallelised
+    with a thread pool. A failed GraphQL batch is retried across primary +
+    secondary rate limits and finally rescued via REST, so no repo is lost.
     """
     session = _session(token)
     auth = verify_auth(session)
@@ -225,69 +430,152 @@ def process_repos(
     processed_lock = threading.Lock()
     start_time = time.time()
 
-    # Track remaining rate limit across threads
+    # Track remaining REST rate limit across threads (also used by the
+    # REST fallback that rescues batches when GraphQL keeps failing)
     rl_remaining = auth["remaining"] if auth else None
     rl_reset_ts = auth["reset_ts"] if auth else 0
     rl_lock = threading.Lock()
 
-    def _check_one(owner: str, repo: str) -> dict | None:
-        """Check one repo, retrying on rate-limit. Returns None if cancelled."""
+    # Try GraphQL batching first (requires a token)
+    gql_session: _requests.Session | None = None
+    use_gql = False
+    if token:
+        g = _session(token, graphql=True)
+        if _graphql_usable(g):
+            gql_session, use_gql = g, True
+        elif log_cb:
+            log_cb("⚠ GraphQL API unavailable for this token - "
+                   "falling back to REST (1 request per repo)")
+
+    if use_gql:
+        batch_size = GRAPHQL_BATCH_SIZE
+        # Each GraphQL request already carries many repos, so cap how many
+        # of those big requests run at once (secondary-rate-limit safety).
+        pool_workers = max(1, min(max_workers, GRAPHQL_CONCURRENCY))
+        if log_cb:
+            n_req = (total + GRAPHQL_BATCH_SIZE - 1) // GRAPHQL_BATCH_SIZE
+            log_cb(f"⚙  GraphQL batching: {total} repos → ~{n_req} request(s) "
+                   f"({GRAPHQL_BATCH_SIZE} repos/request, "
+                   f"≤{GRAPHQL_CONCURRENCY} concurrent)")
+    else:
+        batch_size = 1
+        pool_workers = max_workers
+    batches = [repos[i:i + batch_size] for i in range(0, total, batch_size)]
+
+    def _rest_with_retries(owner: str, repo: str) -> dict:
+        """Check one repo via REST, retrying primary/secondary rate limits."""
         nonlocal rl_remaining, rl_reset_ts
 
         if cancel and cancel.is_set():
-            return None
+            return {"ok": False, "error": "Cancelled"}
 
-        # Pre-check rate limit (approximate, shared across threads)
+        # Pre-check the shared rate-limit counter (approximate) so threads
+        # don't stampede the API when almost no requests are left
         with rl_lock:
+            wait = 0.0
             if rl_remaining is not None and rl_remaining < 5:
                 wait = max(0, rl_reset_ts - time.time()) + 5
-                if wait > 0:
-                    if log_cb:
-                        log_cb(f"⏳ Rate-limit low - waiting {wait:.0f}s …")
-                    _interruptible_sleep(wait, cancel)
-                    if cancel and cancel.is_set():
-                        return None
-                    # Re-check auth after wait
-                    new_auth = verify_auth(session)
-                    if new_auth:
-                        rl_remaining = new_auth["remaining"]
-                        rl_reset_ts = new_auth["reset_ts"]
+        if wait > 0:
+            if log_cb:
+                log_cb(f"⏳ Rate-limit low - waiting {wait:.0f}s …")
+            _interruptible_sleep(wait, cancel)
+            if cancel and cancel.is_set():
+                return {"ok": False, "error": "Cancelled"}
+            new_auth = verify_auth(session)
+            if new_auth:
+                with rl_lock:
+                    rl_remaining = new_auth["remaining"]
+                    rl_reset_ts = new_auth["reset_ts"]
 
         for attempt in range(MAX_RETRIES):
             if cancel and cancel.is_set():
-                return None
+                return {"ok": False, "error": "Cancelled"}
 
             info = fetch_repo(session, owner, repo)
 
-            # Decrement remaining counter
             with rl_lock:
                 if rl_remaining is not None:
                     rl_remaining -= 1
 
-            # Handle rate-limit with retry
-            if info.get("rate_limited"):
+            if not info.get("rate_limited"):
+                return info
+
+            # Rate-limited: honour the secondary Retry-After, or the
+            # primary limit's reset time
+            retry_after = info.get("retry_after")
+            if retry_after is not None:
+                wait = float(retry_after) + 1
+                msg = f"⏳ Secondary rate limit - waiting {wait:.0f}s …"
+            else:
                 wait = max(0, info.get("reset_ts", time.time() + 60)) - time.time() + 5
+                msg = f"⏳ Rate-limited - waiting {wait:.0f}s …"
+            if log_cb:
+                log_cb(msg)
+            _interruptible_sleep(wait, cancel)
+            if cancel and cancel.is_set():
+                return {"ok": False, "error": "Cancelled"}
+
+            # Re-check auth after the wait
+            new_auth = verify_auth(session)
+            if new_auth:
+                with rl_lock:
+                    rl_remaining = new_auth["remaining"]
+                    rl_reset_ts = new_auth["reset_ts"]
+
+        # All retries exhausted
+        return {"ok": False, "error": "Rate-limited (retries exhausted)"}
+
+    def _process_batch(pairs: list[tuple[str, str]]) -> list[dict] | None:
+        """Check one batch; returns per-repo info dicts, or None if cancelled."""
+        if cancel and cancel.is_set():
+            return None
+
+        if gql_session is not None:
+            fallback_reason: str | None = None
+            for attempt in range(MAX_RETRIES + 1):
+                if cancel and cancel.is_set():
+                    return None
+
+                infos, blk = fetch_graphql_batch(gql_session, pairs)
+                if blk is None:
+                    return infos
+
+                reason = blk.get("error", "GraphQL error")
+                if blk.get("immediate_rest"):
+                    # No point hammering a query GitHub just killed
+                    fallback_reason = reason
+                    break
+
+                if blk.get("rate_limited"):
+                    wait = max(0.0, blk.get("reset_ts", time.time() + 60)
+                               - time.time()) + 5
+                elif blk.get("retry_after") is not None:
+                    wait = float(blk["retry_after"]) + 1
+                else:
+                    wait = 1.5 * (attempt + 1)   # transient error: back off
                 if log_cb:
-                    log_cb(f"⏳ Rate-limited - waiting {wait:.0f}s …")
+                    log_cb(f"⏳ {reason} - waiting {wait:.0f}s …")
                 _interruptible_sleep(wait, cancel)
                 if cancel and cancel.is_set():
                     return None
-                # Re-check auth after wait
-                new_auth = verify_auth(session)
-                if new_auth:
-                    rl_remaining = new_auth["remaining"]
-                    rl_reset_ts = new_auth["reset_ts"]
-                continue
+            else:
+                fallback_reason = "retries exhausted"
+            if log_cb:
+                log_cb(f"⚠ GraphQL ({fallback_reason}) - retrying "
+                       f"{len(pairs)} repo(s) via REST")
 
-            return (owner, repo, info)
+        # REST fallback (or REST-only mode): one request per repo
+        infos = []
+        for owner, repo in pairs:
+            if cancel and cancel.is_set():
+                return None
+            infos.append(_rest_with_retries(owner, repo))
+        return infos
 
-        # All retries exhausted
-        return (owner, repo, {"ok": False, "error": "Rate-limited (retries exhausted)"})
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=pool_workers) as executor:
         future_map = {
-            executor.submit(_check_one, owner, repo): (owner, repo)
-            for owner, repo in repos
+            executor.submit(_process_batch, batch): batch
+            for batch in batches
         }
 
         for future in as_completed(future_map):
@@ -299,48 +587,49 @@ def process_repos(
                     log_cb("⛔ Cancelled.")
                 break
 
-            result = future.result()
-            if result is None:
+            infos = future.result()
+            if infos is None:
                 continue
 
-            owner, repo, info = result
+            for info, (owner, repo) in zip(infos, future_map[future]):
+                with processed_lock:
+                    processed += 1
+                    cur = processed
 
-            with processed_lock:
-                processed += 1
-                cur = processed
+                # ETA calculation
+                elapsed = time.time() - start_time
+                rate = cur / elapsed if elapsed > 0 else 0
+                eta_secs = (total - cur) / rate if rate > 0 else 0
 
-            # ETA calculation
-            elapsed = time.time() - start_time
-            rate = cur / elapsed if elapsed > 0 else 0
-            eta_secs = (total - cur) / rate if rate > 0 else 0
+                dyn_info = {"cur": cur, "total": total,
+                            "eta": eta_secs, "rate": rate}
 
-            dyn_info = {"cur": cur, "total": total, "eta": eta_secs, "rate": rate}
+                if progress_cb:
+                    progress_cb(cur, total, dyn_info)
 
-            if progress_cb:
-                progress_cb(cur, total, dyn_info)
-
-            if info["ok"]:
-                ds = info["pushed_at"].strftime("%Y-%m-%d") if info["pushed_at"] else "N/A"
-                arc = " [ARCHIVED]" if info["archived"] else ""
-                with results_lock:
-                    results.append({
-                        "name": f"{owner}/{repo}",
-                        "date": info["pushed_at"],
-                        "url": f"https://github.com/{owner}/{repo}",
-                        "archived": info["archived"],
-                        "stars": info["stars"],
-                    })
-                if log_cb:
-                    log_cb(f"[{cur}/{total}] ✅ {owner}/{repo}  -  {ds}{arc}")
-            else:
-                with results_lock:
-                    errors.append({
-                        "name": f"{owner}/{repo}",
-                        "url": f"https://github.com/{owner}/{repo}",
-                        "error": info["error"],
-                    })
-                if log_cb:
-                    log_cb(f"[{cur}/{total}] ❌ {owner}/{repo}  -  {info['error']}")
+                if info["ok"]:
+                    ds = (info["pushed_at"].strftime("%Y-%m-%d")
+                          if info["pushed_at"] else "N/A")
+                    arc = " [ARCHIVED]" if info["archived"] else ""
+                    with results_lock:
+                        results.append({
+                            "name": f"{owner}/{repo}",
+                            "date": info["pushed_at"],
+                            "url": f"https://github.com/{owner}/{repo}",
+                            "archived": info["archived"],
+                            "stars": info["stars"],
+                        })
+                    if log_cb:
+                        log_cb(f"[{cur}/{total}] ✅ {owner}/{repo}  -  {ds}{arc}")
+                else:
+                    with results_lock:
+                        errors.append({
+                            "name": f"{owner}/{repo}",
+                            "url": f"https://github.com/{owner}/{repo}",
+                            "error": info["error"],
+                        })
+                    if log_cb:
+                        log_cb(f"[{cur}/{total}] ❌ {owner}/{repo}  -  {info['error']}")
 
     return results, errors
 

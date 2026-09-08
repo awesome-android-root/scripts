@@ -2,7 +2,12 @@
 
 Checks GitHub repositories listed in a file (such as a category page under `docs/apps-and-modules/`) for their
 last-update dates via the GitHub API. Produces a sorted Markdown or HTML report with health scores, star counts,
-and freshness metrics. Supports parallel API requests for speed.
+and freshness metrics.
+
+When a token is supplied it uses **GraphQL batch queries** (up to 100 repos per request, so a 500-repo list needs
+only ~5 requests and a fraction of the rate-limit budget); it automatically falls back to parallel REST API
+requests when GraphQL is unavailable or a batch keeps failing (rate limits, timeouts), so results are identical
+either way. Secondary rate limits (`Retry-After`) are honoured instead of being reported as errors.
 
 Supports both a graphical interface and command-line mode.
 
