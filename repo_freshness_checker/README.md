@@ -44,9 +44,14 @@ python repo_freshness_checker/repo_freshness_checker.py
 The GUI input picker lets you choose a folder and automatically reads all `.md` files in it and its subfolders.
 Repositories are de-duplicated across all discovered files.
 
+Results appear in a table as they are checked — no waiting for a run to finish. The table is sortable by
+clicking any heading, and can be narrowed with the search box and the status dropdown. Double-click a row (or
+press `Enter`) to open that repository on GitHub.
+
 The token field shows its verification state as you type (✓ valid, ✗ rejected, ⚠ unauthenticated) and a token is
 only saved to disk once GitHub has confirmed it. Shortcuts: `Ctrl+O` choose folder, `Ctrl+S` save token,
-`Enter` in the output field starts a run, `Esc` cancels it.
+`Ctrl+F` focus search, `Ctrl+C` copy the selected repository, `Enter` in the output field starts a run,
+`Esc` cancels it.
 
 ### HTML report
 

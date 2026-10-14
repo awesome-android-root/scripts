@@ -240,8 +240,9 @@ def fetch_repo(session: _requests.Session, owner: str, repo: str) -> dict:
 def process_repos(
     repos: list[tuple[str, str]],
     token: str,
-    progress_cb=None,   # (current, total) -> None
+    progress_cb=None,   # (current, total, dyn_info) -> None
     log_cb=None,         # (msg: str) -> None
+    result_cb=None,      # (record: dict) -> None, called as each repo lands
     cancel: threading.Event | None = None,
     max_workers: int = DEFAULT_WORKERS,
 ) -> tuple[list[dict], list[dict]]:
@@ -363,23 +364,29 @@ def process_repos(
             if info["ok"]:
                 ds = info["pushed_at"].strftime("%Y-%m-%d") if info["pushed_at"] else "N/A"
                 arc = " [ARCHIVED]" if info["archived"] else ""
+                record = {
+                    "name": f"{owner}/{repo}",
+                    "date": info["pushed_at"],
+                    "url": f"https://github.com/{owner}/{repo}",
+                    "archived": info["archived"],
+                    "stars": info["stars"],
+                }
                 with results_lock:
-                    results.append({
-                        "name": f"{owner}/{repo}",
-                        "date": info["pushed_at"],
-                        "url": f"https://github.com/{owner}/{repo}",
-                        "archived": info["archived"],
-                        "stars": info["stars"],
-                    })
+                    results.append(record)
+                if result_cb:
+                    result_cb(record)
                 if log_cb:
                     log_cb(f"[{cur}/{total}] ✅ {owner}/{repo}  -  {ds}{arc}")
             else:
+                record = {
+                    "name": f"{owner}/{repo}",
+                    "url": f"https://github.com/{owner}/{repo}",
+                    "error": info["error"],
+                }
                 with results_lock:
-                    errors.append({
-                        "name": f"{owner}/{repo}",
-                        "url": f"https://github.com/{owner}/{repo}",
-                        "error": info["error"],
-                    })
+                    errors.append(record)
+                if result_cb:
+                    result_cb(record)
                 if log_cb:
                     log_cb(f"[{cur}/{total}] ❌ {owner}/{repo}  -  {info['error']}")
 
@@ -405,6 +412,22 @@ STATUS_BUCKETS: list[tuple[str, str, str]] = [
 _BUCKET_LABEL = {key: label for key, label, _ in STATUS_BUCKETS}
 _HEALTH_BY_RATIO = ((0.9, "🟢", "Excellent"), (0.7, "🟡", "Fair"),
                     (0.4, "🟠", "Poor"))
+
+
+_STATUS_LABEL = {key: label for key, label, _ in STATUS_BUCKETS}
+# Sort rank within the status column, stalest first.
+_STATUS_ORDER = {"Stale": 0, "Old": 1, "Aging": 2, "Active": 3,
+                 "Archived": 4, "Unknown": 5, "Unreachable": 6}
+
+
+def _bucket_for_days(days: int) -> str:
+    if days > 5 * 365:
+        return "stale"
+    if days > 3 * 365:
+        return "old"
+    if days > 365:
+        return "aging"
+    return "active"
 
 
 def _age_str(days: int) -> str:
@@ -1179,9 +1202,86 @@ def run_gui():
             self.prog_lbl = ttk.Label(pf, text="  0 / 0", width=26)
             self.prog_lbl.pack(side="left", padx=6)
 
-            # ── Log ───────────────────────────────────────────
-            lf = ttk.LabelFrame(main, text="Log", padding=6)
-            lf.pack(fill="both", expand=True, **pad)
+            # ── Results / Log ────────────────────────────────
+            nb = ttk.Notebook(main)
+            nb.pack(fill="both", expand=True, **pad)
+            self.notebook = nb
+
+            # -- Results tab: the table is the point of the tool --
+            results_tab = ttk.Frame(nb, padding=6)
+            nb.add(results_tab, text="Results")
+
+            summary_bar = ttk.Frame(results_tab)
+            summary_bar.pack(fill="x", pady=(0, 6))
+            self.health_lbl = ttk.Label(summary_bar, text="—",
+                                        font=("sans-serif", 11, "bold"))
+            self.health_lbl.pack(side="left")
+            self.summary_lbl = ttk.Label(summary_bar, text="No results yet",
+                                         foreground=Palette.SUBTEXT)
+            self.summary_lbl.pack(side="left", padx=10)
+
+            # Filter toolbar
+            fb = ttk.Frame(results_tab)
+            fb.pack(fill="x", pady=(0, 6))
+            ttk.Label(fb, text="🔍").pack(side="left")
+            self.search_var = tk.StringVar()
+            self.search_entry = ttk.Entry(fb, textvariable=self.search_var,
+                                          width=30)
+            self.search_entry.pack(side="left", fill="x", expand=True, padx=(4, 8))
+            self.filter_var = tk.StringVar(value="All")
+            self.status_filter = ttk.Combobox(
+                fb, textvariable=self.filter_var, width=12, state="readonly",
+                values=["All", "Active", "Aging", "Old", "Stale", "Archived",
+                        "Unreachable"])
+            self.status_filter.pack(side="left")
+            self.row_count_lbl = ttk.Label(fb, text="",
+                                           foreground=Palette.SUBTEXT)
+            self.row_count_lbl.pack(side="left", padx=8)
+
+            columns = ("name", "date", "age", "stars", "status")
+            self.tree = ttk.Treeview(results_tab, columns=columns,
+                                     show="headings", selectmode="browse")
+            headings = {
+                "name": ("Repository", 280, "w"),
+                "date": ("Last commit", 110, "e"),
+                "age": ("Age", 70, "e"),
+                "stars": ("Stars", 70, "e"),
+                "status": ("Status", 100, "w"),
+            }
+            for key, (label, width, anchor) in headings.items():
+                self.tree.heading(key, text=label,
+                                  command=lambda c=key: self._sort_by(c))
+                self.tree.column(key, width=width, anchor=anchor,
+                                 stretch=(key == "name"))
+            vsb = ttk.Scrollbar(results_tab, orient="vertical",
+                                command=self.tree.yview)
+            self.tree.configure(yscrollcommand=vsb.set)
+            tree_wrap = ttk.Frame(results_tab)
+            tree_wrap.pack(fill="both", expand=True)
+            self.tree.pack(side="left", fill="both", expand=True)
+            vsb.pack(side="right", fill="y")
+
+            self.tree.tag_configure("stale", foreground=Palette.RED)
+            self.tree.tag_configure("old", foreground="#fab387")
+            self.tree.tag_configure("archived", foreground=Palette.SUBTEXT)
+            self.tree.tag_configure("error", foreground=Palette.RED)
+            self.tree.bind("<Double-1>", self._open_selected)
+            self.tree.bind("<Return>", self._open_selected)
+            self.tree.bind("<Control-c>", self._copy_selected)
+
+            # Stalest first: that is the whole point of the tool, and it
+            # matches the order the Markdown and HTML reports use.
+            self._sort_col = "date"
+            self._sort_desc = False
+            self._rows = []          # [(iid, values, tags)]
+            self._next_iid = 0
+
+            self.search_var.trace_add("write", lambda *_: self._refresh_table())
+            self.filter_var.trace_add("write", lambda *_: self._refresh_table())
+
+            # -- Log tab --
+            log_tab = ttk.Frame(nb, padding=6)
+            nb.add(log_tab, text="Log")
 
             if sys.platform == "win32":
                 log_font = ("Consolas", 10)
@@ -1191,7 +1291,7 @@ def run_gui():
                 log_font = ("monospace", 10)
 
             self.log = scrolledtext.ScrolledText(
-                lf, height=12, state="disabled", wrap="word",
+                log_tab, height=12, state="disabled", wrap="word",
                 font=log_font,
                 bg=Palette.SURF_ALT, fg=Palette.TEXT,
                 insertbackground=Palette.TEXT,
@@ -1274,10 +1374,17 @@ def run_gui():
             self.bind("<Control-o>", lambda e: self._browse_in())
             self.bind("<Control-s>", lambda e: self._save_tok())
             self.bind("<Control-Return>", lambda e: self._start())
+            self.bind("<Control-f>", lambda e: self._focus_search())
+            self.bind("<Control-c>", lambda e: self._copy_selected())
             self.bind("<Escape>", lambda e: self._stop())
             # Enter in the output field is the common "I'm done, run it".
             self.out_entry.bind("<Return>", lambda e: self._start())
             self.tok_entry.bind("<Return>", lambda e: self._verify_token())
+
+        def _focus_search(self, event=None):
+            self.search_entry.focus_set()
+            self.search_entry.select_range(0, "end")
+            return "break"
 
         # ── config persistence ────────────────────────────────
         CONFIG_FILE = CONFIG_DIR / "gui_config.json"
@@ -1494,6 +1601,158 @@ def run_gui():
             self.log.see("end")
             self.log.config(state="disabled")
 
+        # ── results table ──────────────────────────────────────
+        def _status_of(self, record: dict) -> tuple[str, str, str]:
+            """Return (display label, treeview tag, filter key)."""
+            if "error" in record:
+                return "Unreachable", "error", "Unreachable"
+            days = _age_days(record, datetime.now(timezone.utc))
+            if record["archived"]:
+                return _STATUS_LABEL["archived"], "archived", "Archived"
+            if days is None:
+                return "Unknown", "archived", "Archived"
+            key = _bucket_for_days(days)
+            return _STATUS_LABEL[key], key, key.capitalize()
+
+        def _add_row(self, record: dict):
+            """Insert one result, keeping the table sorted as it fills."""
+            label, tag, status_key = self._status_of(record)
+            days = None
+            if "error" in record:
+                values = (record["name"], "—", "—", "—", label)
+                sort_key = (0, "", 0)
+            else:
+                date = record["date"]
+                days = _age_days(record, datetime.now(timezone.utc))
+                values = (
+                    record["name"],
+                    f"{date:%Y-%m-%d}" if date else "n/a",
+                    _age_str(days) if days is not None else "–",
+                    f"{record['stars']:,}",
+                    label,
+                )
+                sort_key = (1, f"{date:%Y-%m-%d}" if date else "", days or 0)
+
+            self._next_iid += 1
+            iid = f"r{self._next_iid}"
+            self._rows.append({
+                "iid": iid,
+                "values": values,
+                "tags": (tag,),
+                "text": f"{record['name']} {values[1]}".lower(),
+                "status": status_key,
+                "date": values[1],
+                "days": days if days is not None else 0,
+                "stars": record.get("stars", -1),
+                "error": "error" in record,
+                "sort": sort_key,
+            })
+            self._refresh_table()
+
+        def _clear_rows(self):
+            self._rows.clear()
+            self._next_iid = 0
+            self.tree.delete(*self.tree.get_children())
+            self.summary_lbl.config(text="No results yet")
+            self.health_lbl.config(text="—")
+            self.row_count_lbl.config(text="")
+
+        def _sort_by(self, column: str):
+            """Click a heading to sort; click again to reverse."""
+            if self._sort_col == column:
+                self._sort_desc = not self._sort_desc
+            else:
+                self._sort_col = column
+                self._sort_desc = column in ("date", "age", "stars")
+            self._refresh_table()
+
+        def _visible_rows(self) -> list[dict]:
+            rows = self._rows
+            needle = self.search_var.get().strip().lower()
+            status = self.filter_var.get()
+            if needle:
+                rows = [r for r in rows if needle in r["text"]]
+            if status != "All":
+                rows = [r for r in rows if r["status"] == status]
+
+            col = self._sort_col
+            if col == "name":
+                key = lambda r: r["values"][0].lower()
+            elif col == "date":
+                key = lambda r: r["date"]
+            elif col == "age":
+                key = lambda r: r["days"]
+            elif col == "stars":
+                key = lambda r: r["stars"]
+            else:  # status
+                key = lambda r: _STATUS_ORDER.get(r["status"], 9)
+            ordered = sorted(rows, key=key, reverse=self._sort_desc)
+            # Unreachable rows always sit at the bottom, either direction.
+            reachable = [r for r in ordered if not r["error"]]
+            unreachable = [r for r in ordered if r["error"]]
+            return reachable + unreachable
+
+        def _refresh_table(self):
+            """Re-render rows from the model, applying filter and sort."""
+            visible = self._visible_rows()
+            selected = self.tree.selection()
+            keep = selected[0] if selected else None
+
+            self.tree.delete(*self.tree.get_children())
+            for row in visible:
+                self.tree.insert("", "end", iid=row["iid"],
+                                 values=row["values"], tags=row["tags"])
+            if keep and self.tree.exists(keep):
+                self.tree.selection_set(keep)
+                self.tree.see(keep)
+
+            total = len(self._rows)
+            shown = len(visible)
+            self.row_count_lbl.config(
+                text=f"{shown} of {total} shown" if shown != total
+                else f"{total} repos")
+
+        def _finish_table(self, results: list[dict], errors: list[dict]):
+            """Update the summary line once the run completes."""
+            stats = _summarize(results, errors, datetime.now(timezone.utc))
+            self.health_lbl.config(text=stats["health"])
+            colour = {"Excellent": Palette.GREEN, "Fair": Palette.YELLOW,
+                      "Poor": "#fab387", "Critical": Palette.RED}.get(
+                          stats["health_label"], Palette.TEXT)
+            self.health_lbl.config(foreground=colour)
+
+            parts = [f"{stats['total']} checked",
+                     f"{stats['total_ok']} reachable",
+                     f"{stats['total_err']} unreachable",
+                     f"{stats['stars']:,} stars"]
+            if stats["median_days"] is not None:
+                parts.append(f"median age {_age_str(stats['median_days'])}")
+            self.summary_lbl.config(text="  ·  ".join(parts))
+            self._refresh_table()
+
+        def _open_selected(self, *_):
+            """Open the repository the user picked in the table."""
+            selection = self.tree.selection()
+            if not selection:
+                return
+            iid = selection[0]
+            for row in self._rows:
+                if row["iid"] == iid:
+                    slug = row["values"][0]
+                    webbrowser.open(f"https://github.com/{slug}")
+                    return
+
+        def _copy_selected(self, *_):
+            selection = self.tree.selection()
+            if not selection:
+                return
+            for row in self._rows:
+                if row["iid"] == selection[0]:
+                    self.clipboard_clear()
+                    self.clipboard_append(row["values"][0])
+                    self._safe_status(f"Copied {row['values'][0]}")
+                    return
+
         def _progress(self, cur, total, dyn_info=None):
             pct = cur / total * 100 if total else 0
             self.prog["value"] = pct
@@ -1546,6 +1805,8 @@ def run_gui():
             self.prog["value"] = 0
             self.prog_lbl.config(text="  0 / 0")
             self.status_var.set("Checking token …")
+            self._clear_rows()
+            self.notebook.select(0)
 
             # Resolve output paths here: the worker thread must not touch
             # Tk variables.
@@ -1604,6 +1865,7 @@ def run_gui():
                     repos, tok,
                     progress_cb=self._safe_progress,
                     log_cb=self._safe_log,
+                    result_cb=self._safe_row,
                     cancel=self.cancel_event,
                     max_workers=workers,
                 )
@@ -1618,6 +1880,7 @@ def run_gui():
                     else:
                         generate_report(results, errors, path)
                     self._safe_log(f"📝 Saved → {path}")
+                self._safe_finish_table(results, errors)
                 self._safe_log(
                     f"   ✅ {len(results)} reachable  |  "
                     f"❌ {len(errors)} unreachable")
@@ -1647,6 +1910,12 @@ def run_gui():
         # thread-safe helpers
         def _safe_log(self, msg):
             self.after(0, self._log, msg)
+
+        def _safe_row(self, record):
+            self.after(0, self._add_row, record)
+
+        def _safe_finish_table(self, results, errors):
+            self.after(0, self._finish_table, results, errors)
 
         def _safe_progress(self, cur, total, dyn_info=None):
             self.after(0, self._progress, cur, total, dyn_info)
