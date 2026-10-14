@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-GitHub Repo Freshness Checker v2.2
-===================================
-Reads a file containing GitHub URLs, checks last-update dates via the
-GitHub API, and writes a sorted Markdown report.  Uses parallel API
-requests (ThreadPoolExecutor) for drastically faster checking.
+GitHub Repo Freshness Checker
+============================
+Reads files containing GitHub URLs, checks each repository's last push via
+the GitHub API, and writes a sorted Markdown and/or HTML report.  Requests
+run in parallel (ThreadPoolExecutor), and the token is validated against the
+API before any checking starts.
 
   GUI mode : python repo_freshness_checker.py
-  CLI mode : python repo_freshness_checker.py README.md -o report.md -t ghp_xxxx
+  CLI mode : python repo_freshness_checker.py README.md -o report.md -t ghp_xxx
 
 """
 
@@ -24,7 +25,7 @@ except ImportError:
     sys.exit(1)
 
 # ──────────────────────────── config ────────────────────────────
-VERSION           = "2.3.0"
+VERSION           = "2.4.0"
 CONFIG_DIR        = Path.home() / ".repo-freshness-checker"
 TOKEN_FILE        = CONFIG_DIR / "token"
 API_BASE          = "https://api.github.com"
@@ -57,21 +58,61 @@ def clear_saved_token():
         TOKEN_FILE.unlink()
 
 
-def validate_token(token: str) -> tuple[bool, str]:
-    """Basic validation of GitHub token format. Returns (is_valid, message)."""
+def check_token(token: str, timeout: int = 10) -> dict:
+    """Validate a token against the GitHub API (GET /user).
+
+    Returns {"ok", "level", "message", "login", "limit", "remaining"} where
+    level is "ok" | "warn" | "error".  An empty token is not an error: the
+    tool works unauthenticated, just with a 60 requests/hour limit.
+    """
+    token = (token or "").strip()
     if not token:
-        return False, "Token is empty"
-    t = token.strip()
-    # Classic PATs: ghp_, gho_, ghu_, ghs_, ghr_
-    # Fine-grained PATs: github_pat_
-    if re.match(r'^(gh[opusr]_|github_pat_)', t):
-        if len(t) < 20:
-            return False, "Token seems too short (likely invalid)"
-        return True, ""
-    # Could be a token passed via env var in a different format
-    if len(t) >= 40:
-        return True, ""
-    return False, "Doesn't look like a GitHub token (should start with ghp_ or github_pat_)"
+        return {"ok": False, "level": "warn", "login": None, "limit": 60,
+                "remaining": None,
+                "message": "No token - unauthenticated (60 requests/hour)"}
+
+    session = _session(token)
+    try:
+        r = session.get(f"{API_BASE}/user", timeout=timeout)
+    except _requests.exceptions.Timeout:
+        return {"ok": False, "level": "error", "login": None, "limit": None,
+                "remaining": None,
+                "message": "Timed out talking to api.github.com"}
+    except _requests.exceptions.RequestException as exc:
+        return {"ok": False, "level": "error", "login": None, "limit": None,
+                "remaining": None,
+                "message": f"Cannot reach GitHub: {exc}"}
+
+    def _int(header):
+        try:
+            return int(r.headers[header])
+        except (KeyError, ValueError):
+            return None
+
+    info = {"ok": False, "level": "error", "login": None,
+            "limit": _int("X-RateLimit-Limit"),
+            "remaining": _int("X-RateLimit-Remaining"),
+            "message": ""}
+
+    if r.status_code == 200:
+        info.update(ok=True, level="ok", login=r.json().get("login") or "?",
+                    message=f"Valid - authenticated as "
+                            f"{r.json().get('login') or '?'}")
+    elif r.status_code == 401:
+        info["message"] = ("Token rejected by GitHub - invalid, expired "
+                           "or revoked")
+    elif r.status_code == 403:
+        if info["remaining"] == 0:
+            info["level"] = "warn"
+            info["message"] = ("Token may be valid, but its rate limit is "
+                               "exhausted")
+        else:
+            info["message"] = ("Forbidden. For an org/SSO token, authorise "
+                               "it at https://github.com/settings/tokens")
+    else:
+        info["message"] = f"GitHub returned HTTP {r.status_code}"
+
+    return info
 
 # ──────────────────── URL extraction ────────────────────────────
 _GH_URL_RE = re.compile(
@@ -353,449 +394,513 @@ def _interruptible_sleep(seconds, cancel):
         time.sleep(0.5)
 
 # ──────────────────── report generation ─────────────────────────
+# (key, label, range) - one entry per freshness bucket, in report order.
+STATUS_BUCKETS: list[tuple[str, str, str]] = [
+    ("active",   "🟢 Active",  "< 1 yr"),
+    ("aging",    "🟡 Aging",   "1-3 yrs"),
+    ("old",      "🟠 Old",     "3-5 yrs"),
+    ("stale",    "🔴 Stale",   "5+ yrs"),
+    ("archived", "📦 Archived", "read-only"),
+]
+_BUCKET_LABEL = {key: label for key, label, _ in STATUS_BUCKETS}
+_HEALTH_BY_RATIO = ((0.9, "🟢", "Excellent"), (0.7, "🟡", "Fair"),
+                    (0.4, "🟠", "Poor"))
+
+
 def _age_str(days: int) -> str:
+    if days <= 0:
+        return "today"
     y, rem = divmod(days, 365)
     m = rem // 30
     if y:
-        return f"{y}y {m}m"
+        return f"{y}y {m}m" if m else f"{y}y"
     if m:
         return f"{m}m"
     return f"{days}d"
 
+
+def _age_days(r: dict, now: datetime) -> int | None:
+    if not r.get("date"):
+        return None
+    return max(0, (now - r["date"]).days)
+
+
+def _bucket(r: dict, now: datetime) -> str:
+    if r["archived"]:
+        return "archived"
+    d = _age_days(r, now)
+    if d is None:
+        return "archived"
+    if d > 5 * 365:
+        return "stale"
+    if d > 3 * 365:
+        return "old"
+    if d > 365:
+        return "aging"
+    return "active"
+
+
 def _status(days: int, archived: bool) -> str:
+    """Human-readable status for a repo of the given age."""
     if archived:
-        return "📦 Archived"
+        return _BUCKET_LABEL["archived"]
     if days > 5 * 365:
-        return "🔴 5 + yrs"
+        return _BUCKET_LABEL["stale"]
     if days > 3 * 365:
-        return "🟠 3-5 yrs"
+        return _BUCKET_LABEL["old"]
     if days > 365:
-        return "🟡 1-3 yrs"
-    return "🟢 Active"
+        return _BUCKET_LABEL["aging"]
+    return _BUCKET_LABEL["active"]
+
+
+def _summarize(results: list[dict], errors: list[dict],
+               now: datetime) -> dict:
+    """Derive every number both report formats need.
+
+    Callers may rely on *results* already being sorted oldest-first.
+    """
+    counts = {key: 0 for key, _, _ in STATUS_BUCKETS}
+    dated: list[dict] = []
+    for r in results:
+        counts[_bucket(r, now)] += 1
+        if r.get("date"):
+            dated.append(r)
+    dated.sort(key=lambda r: r["date"])
+
+    # Health: share of non-archived repos updated within the last year.
+    live = len(results) - counts["archived"]
+    fresh = sum(1 for r in dated
+                if not r["archived"] and _age_days(r, now) <= 365)
+    ratio = fresh / live if live else 0
+    if live:
+        emoji, label = next(((e, l) for t, e, l in _HEALTH_BY_RATIO
+                             if ratio >= t), ("🔴", "Critical"))
+    else:
+        emoji, label = "❓", "No data"
+
+    ages = sorted(_age_days(r, now) for r in dated if _age_days(r, now))
+    median = ages[len(ages) // 2] if ages else None
+
+    return {
+        "counts": counts,
+        "total_ok": len(results),
+        "total_err": len(errors),
+        "total": len(results) + len(errors),
+        "stars": sum(r.get("stars", 0) for r in results),
+        "oldest": dated[0] if dated else None,
+        "newest": dated[-1] if dated else None,
+        "median_days": median,
+        "fresh": fresh,
+        "live": live,
+        "ratio": ratio,
+        "health": f"{emoji} {label}",
+        "health_emoji": emoji,
+        "health_label": label,
+        "error_kinds": _group_errors(errors),
+    }
+
+
+def _group_errors(errors: list[dict]) -> dict[str, int]:
+    """Count errors by kind so the report can summarise the failures."""
+    kinds: dict[str, int] = {}
+    for e in errors:
+        kinds[e["error"]] = kinds.get(e["error"], 0) + 1
+    return dict(sorted(kinds.items(), key=lambda kv: -kv[1]))
+
 
 def _health_score(results: list[dict]) -> str:
-    """Return an overall health emoji based on results distribution."""
+    """Overall health emoji based on the distribution of results."""
     if not results:
         return "❓"
-    active = sum(1 for r in results if r.get("date") and not r["archived"]
-                 and (datetime.now(timezone.utc) - r["date"]).days <= 365)
-    ratio = active / len(results)
-    if ratio >= 0.9:
-        return "🟢 Excellent"
-    if ratio >= 0.7:
-        return "🟡 Fair"
-    if ratio >= 0.4:
-        return "🟠 Poor"
-    return "🔴 Critical"
+    now = datetime.now(timezone.utc)
+    return _summarize(results, [], now)["health"]
 
 
 def generate_report(results: list[dict], errors: list[dict], path: str):
-    """Generate a polished Markdown report sorted oldest → newest."""
+    """Write a Markdown report, sorted oldest commit first."""
     now = datetime.now(timezone.utc)
-    results.sort(
-        key=lambda r: r["date"] or datetime.min.replace(tzinfo=timezone.utc)
-    )
-
-    counts: dict[str, int] = {
-        "🟢 Active (< 1 yr)": 0,
-        "🟡 Aging (1-3 yrs)": 0,
-        "🟠 Old (3-5 yrs)": 0,
-        "🔴 Stale (5 + yrs)": 0,
-        "📦 Archived": 0,
-    }
-    for r in results:
-        if r["archived"]:
-            counts["📦 Archived"] += 1
-        elif r["date"]:
-            d = (now - r["date"]).days
-            if d > 5*365:   counts["🔴 Stale (5 + yrs)"] += 1
-            elif d > 3*365: counts["🟠 Old (3-5 yrs)"]   += 1
-            elif d > 365:   counts["🟡 Aging (1-3 yrs)"]  += 1
-            else:           counts["🟢 Active (< 1 yr)"]  += 1
-
-    total_ok = len(results)
-    total_err = len(errors)
-    total = total_ok + total_err
+    results.sort(key=lambda r: r["date"] or datetime.min.replace(tzinfo=timezone.utc))
+    s = _summarize(results, errors, now)
 
     L: list[str] = []
-    L.append(f"# 📊 Repository Freshness Report\n")
-    L.append("<div align=\"center\">\n")
-    L.append(f"> **Generated:** {now.strftime('%Y-%m-%d %H:%M UTC')}  ")
-    L.append(f"> **Repos checked:** {total}  ")
-    L.append(f"> **Health:** {_health_score(results)}  ")
-    L.append("</div>\n")
-    L.append("---\n")
+    L.append("# 📊 Repository Freshness\n")
+    L.append(f"_{now.strftime('%Y-%m-%d %H:%M')} UTC · "
+             f"{s['total']} repositories checked_\n")
 
-    # Summary
-    L.append("## 📋 Summary\n")
-    L.append("| Category | Count | Share |")
-    L.append("|----------|------:|-----:|")
-    ok_total = sum(counts.values())
-    for k, v in counts.items():
-        share = f"{v/ok_total*100:.1f}%" if ok_total else "-"
-        L.append(f"| {k} | {v} | {share} |")
-    L.append(f"| **Total OK** | **{total_ok}** | |")
+    # ── headline ────────────────────────────────────────────────
+    share = f"{s['ratio']:.0%}"
+    L.append(f"**{s['health']}** — {share} of live repos were "
+             f"updated within the past year "
+             f"({s['fresh']} of {s['live']}).\n")
+
+    # ── distribution ─────────────────────────────────────────────
+    L.append("| Status | Range | Count | Share |")
+    L.append("|:--|:--|--:|--:|")
+    for key, label, rng in STATUS_BUCKETS:
+        n = s["counts"][key]
+        pct = f"{n / s['total_ok']:.1%}" if s["total_ok"] else "–"
+        L.append(f"| {label} | {rng} | {n} | {pct} |")
+    L.append(f"| **Total reachable** | | **{s['total_ok']}** | |")
     if errors:
-        L.append(f"| ❌ Errors | {total_err} | |")
+        L.append(f"| ⚠️ Unreachable | 404 / 403 / network | {s['total_err']} | |")
     L.append("")
 
-    # Overall stats row
-    total_stars = sum(r.get("stars", 0) for r in results)
-    avg_stars = total_stars / total_ok if total_ok else 0
-    L.append("> ")
-    L.append(f"> ⭐ **{total_stars:,}** total stars  ·  "
-             f"📦 **{counts['📦 Archived']}** archived  ·  "
-             f"⚠️ **{total_err}** errors")
-    L.append("")
+    # ── supporting numbers ───────────────────────────────────────
+    facts = [f"⭐ **{s['stars']:,}** stars in total"]
+    if s["oldest"]:
+        facts.append(f"oldest commit {_age_str(_age_days(s['oldest'], now))} ago "
+                     f"(`{s['oldest']['date']:%Y-%m-%d}`)")
+    if s["median_days"] is not None:
+        facts.append(f"median age **{_age_str(s['median_days'])}**")
+    if s["newest"]:
+        facts.append(f"newest commit `{s['newest']['date']:%Y-%m-%d}`")
+    L.append(" · ".join(facts) + "\n")
 
-    L.append("---\n")
-
-    # Detailed table
-    L.append("## 📌 Repositories (oldest → newest)\n")
-    L.append("| # | Repository | Last Commit | Age | ⭐ | Status |")
-    L.append("|---|-----------|:-----------|:----|---:|--------|")
+    # ── table ────────────────────────────────────────────────────
+    L.append("## Repositories\n")
+    L.append(f"Oldest first. {s['total_ok']} of {s['total']} reachable.\n")
+    L.append("| # | Repository | Last commit | Age | ⭐ | Status |")
+    L.append("|--:|:--|:--|--:|--:|:--|")
     for i, r in enumerate(results, 1):
-        if r["date"]:
-            d = (now - r["date"]).days
-            ds = r["date"].strftime("%Y-%m-%d")
-            age = _age_str(d)
-            st  = _status(d, r["archived"])
+        d = _age_days(r, now)
+        if d is None:
+            ds, age, st = "n/a", "–", "❓"
         else:
-            ds, age, st = "N/A", "-", "❓"
+            ds, age = f"{r['date']:%Y-%m-%d}", _age_str(d)
+            st = _status(d, r["archived"])
         L.append(f"| {i} | [{r['name']}]({r['url']}) | {ds} | {age} | "
-                 f"{r['stars']} | {st} |")
+                 f"{r['stars']:,} | {st} |")
+    L.append("")
 
+    # ── errors ───────────────────────────────────────────────────
     if errors:
-        L.append("\n---\n")
-        L.append(f"## ⚠️ Errors ({len(errors)})\n")
+        L.append("## Unreachable\n")
+        summary = ", ".join(f"{n}× {kind}"
+                            for kind, n in s["error_kinds"].items())
+        L.append(f"{len(errors)} of {s['total']} repositories could not be "
+                 f"checked — {summary}.\n")
         L.append("| # | Repository | Error |")
-        L.append("|---|-----------|-------|")
+        L.append("|--:|:--|:--|")
         for i, e in enumerate(errors, 1):
             L.append(f"| {i} | [{e['name']}]({e['url']}) | {e['error']} |")
+        L.append("")
 
-    L.append("")
     L.append("---")
-    L.append(f"*Report generated by [Repo Freshness Checker]({API_BASE}) v{VERSION}*")
+    L.append(f"<sub>Repo Freshness Checker v{VERSION} · "
+             f"buckets: 🟢 &lt;1 yr · 🟡 1-3 yrs · 🟠 3-5 yrs · "
+             f"🔴 &gt;5 yrs · 📦 read-only</sub>")
 
     Path(path).write_text("\n".join(L) + "\n", encoding="utf-8")
 
+
 # ──────────────────── HTML report ──────────────────────────────
+_CSS = """
+:root{--bg:#11111b;--surface:#1a1a26;--raised:#232331;--line:#2f2f40;
+ --text:#d7d9e0;--dim:#8b8fa3;--faint:#5f6377;--link:#7aa2f7;
+ --active:#7ec98f;--aging:#e0c274;--old:#dd9268;--stale:#e5748a;
+ --archived:#8b8fa3;--warn:#e0c274;--err:#e5748a}
+html[data-light="true"]{--bg:#f6f7f9;--surface:#fff;--raised:#f0f1f5;--line:#e2e4ea;
+ --text:#1c1e26;--dim:#5b6070;--faint:#8a8fa0;--link:#2f6fd0;
+ --active:#1f7a3d;--aging:#8a6a12;--old:#9a5a24;--stale:#a3304a;
+ --archived:#5b6070;--warn:#8a6a12;--err:#a3304a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);line-height:1.55;
+ font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,sans-serif;
+ -webkit-font-smoothing:antialiased}
+.wrap{max-width:1080px;margin:0 auto;padding:32px 24px 64px}
+a{color:var(--link);text-decoration:none}
+a:hover{text-decoration:underline}
+
+header{display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap;margin-bottom:24px}
+h1{font-size:20px;font-weight:650;margin:0;letter-spacing:-.01em}
+h2{font-size:15px;font-weight:600;margin:32px 0 12px;letter-spacing:-.005em}
+.sub{color:var(--dim);font-size:13px;margin-top:4px}
+.spacer{flex:1}
+
+.health{display:inline-flex;align-items:center;gap:8px;padding:7px 14px;
+ border-radius:999px;font-size:13px;font-weight:600;background:var(--raised);
+ border:1px solid var(--line);white-space:nowrap}
+.health b{font-size:15px}
+
+button,.btn{font:inherit;color:var(--text);background:var(--raised);
+ border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer}
+button:hover{background:var(--line)}
+input,select{font:inherit;color:var(--text);background:var(--raised);
+ border:1px solid var(--line);border-radius:8px;padding:6px 10px}
+input:focus,select:focus{outline:2px solid var(--link);outline-offset:-1px}
+input::placeholder{color:var(--faint)}
+
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+ gap:10px;margin-bottom:24px}
+.tile{background:var(--surface);border:1px solid var(--line);
+ border-radius:10px;padding:12px 14px}
+.tile dt{color:var(--dim);font-size:12px;margin:0 0 2px}
+.tile dd{margin:0;font-size:19px;font-weight:650;letter-spacing:-.01em;
+ font-variant-numeric:tabular-nums}
+.tile .unit{font-size:12px;color:var(--dim);font-weight:400}
+
+.bar{display:flex;height:8px;border-radius:999px;overflow:hidden;
+ background:var(--raised);margin:0 0 20px}
+.bar i{display:block;height:100%}
+.bar .active{background:var(--active)}.bar .aging{background:var(--aging)}
+.bar .old{background:var(--old)}.bar .stale{background:var(--stale)}
+.bar .archived{background:var(--archived)}
+
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;color:var(--dim);
+ font-size:12.5px;margin-bottom:16px}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.dot{width:8px;height:8px;border-radius:50%;flex:none}
+.dot.active{background:var(--active)}.dot.aging{background:var(--aging)}
+.dot.old{background:var(--old)}.dot.stale{background:var(--stale)}
+.dot.archived{background:var(--archived)}
+
+.bar-thead{position:sticky;top:0;z-index:2}
+table{width:100%;border-collapse:separate;border-spacing:0;background:var(--surface);
+ border:1px solid var(--line);border-radius:10px;overflow:hidden}
+th{background:var(--raised);text-align:left;font-size:12px;font-weight:600;
+ color:var(--dim);text-transform:uppercase;letter-spacing:.04em;padding:9px 12px;
+ border-bottom:1px solid var(--line);white-space:nowrap}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:var(--text)}
+th .arrow{color:var(--link);margin-left:4px;opacity:0}
+th[aria-sort] .arrow{opacity:1}
+td{padding:8px 12px;border-bottom:1px solid var(--line);font-size:14px}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:var(--raised)}
+.r{text-align:right;font-variant-numeric:tabular-nums}
+.muted{color:var(--faint)}
+.tag{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;
+ padding:2px 9px;border-radius:999px;border:1px solid transparent;white-space:nowrap}
+.tag.active{color:var(--active);border-color:color-mix(in srgb,var(--active) 35%,transparent)}
+.tag.aging{color:var(--aging);border-color:color-mix(in srgb,var(--aging) 35%,transparent)}
+.tag.old{color:var(--old);border-color:color-mix(in srgb,var(--old) 35%,transparent)}
+.tag.stale{color:var(--stale);border-color:color-mix(in srgb,var(--stale) 35%,transparent)}
+.tag.archived{color:var(--archived);border-color:var(--line)}
+
+.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.toolbar input[type=search]{flex:1;min-width:180px}
+.count{color:var(--dim);font-size:12.5px;margin-left:auto;
+ font-variant-numeric:tabular-nums}
+.empty{text-align:center;padding:40px;color:var(--faint)}
+.err-kind{color:var(--err);font-size:13px}
+footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);
+ color:var(--faint);font-size:12px}
+@media(max-width:640px){.wrap{padding:20px 14px 48px}.num,.age{display:none}}
+"""
+
+_JS = """
+const rows = window.__ROWS__;
+let sortKey = 'date', dir = 1;
+
+const $ = id => document.getElementById(id);
+const tbody = $('body');
+
+function visible() {
+  const q = $('search').value.trim().toLowerCase();
+  const f = $('filter').value;
+  return rows.filter(r => (f === 'all' || r.bucket === f)
+    && (!q || r.name.toLowerCase().includes(q) || r.date.includes(q)));
+}
+
+function render() {
+  const list = visible().slice().sort((a, b) => {
+    const x = a[sortKey], y = b[sortKey];
+    return (x < y ? -1 : x > y ? 1 : 0) * dir;
+  });
+
+  $('count').textContent = list.length === rows.length
+    ? list.length + ' repositories'
+    : list.length + ' of ' + rows.length;
+
+  tbody.innerHTML = list.length ? list.map(r => `
+    <tr>
+      <td class="num muted">${r.num}</td>
+      <td><a href="${r.url}" target="_blank" rel="noopener">${r.name}</a></td>
+      <td class="r muted">${r.date}</td>
+      <td class="r age">${r.age}</td>
+      <td class="r muted">${r.stars.toLocaleString()}</td>
+      <td><span class="tag ${r.bucket}">${r.label}</span></td>
+    </tr>`).join('')
+    : '<tr><td colspan="6" class="empty">Nothing matches these filters.</td></tr>';
+
+  document.querySelectorAll('th[data-key]').forEach(th => {
+    if (th.dataset.key === sortKey) th.setAttribute('aria-sort', dir > 0 ? 'ascending' : 'descending');
+    else th.removeAttribute('aria-sort');
+  });
+}
+
+document.querySelectorAll('th[data-key]').forEach(th => {
+  th.classList.add('sortable');
+  th.insertAdjacentHTML('beforeend', '<span class="arrow">\\u25B2</span>');
+  th.addEventListener('click', () => {
+    const key = th.dataset.key;
+    dir = key === sortKey ? -dir : 1;
+    sortKey = key;
+    render();
+  });
+});
+
+$('search').addEventListener('input', render);
+$('filter').addEventListener('change', render);
+
+document.querySelectorAll('[data-filter]').forEach(el => el.addEventListener('click', () => {
+  $('filter').value = el.dataset.filter;
+  $('search').value = '';
+  render();
+  $('repos').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}));
+
+$('theme').addEventListener('click', () => {
+  const light = document.documentElement.dataset.light === 'true';
+  document.documentElement.dataset.light = String(!light);
+  localStorage.setItem('rf-theme', light ? 'dark' : 'light');
+  $('theme').textContent = light ? 'Light' : 'Dark';
+});
+
+const saved = localStorage.getItem('rf-theme');
+if (saved === 'light') {
+  document.documentElement.dataset.light = 'true';
+  $('theme').textContent = 'Dark';
+}
+
+render();
+"""
+
+
 def generate_html_report(results: list[dict], errors: list[dict], path: str):
-    """Generate a standalone HTML report with filtering and sorting (vanilla JS)."""
+    """Write a standalone HTML report (sorting/filtering, no dependencies)."""
+    import html as _html
+
     now = datetime.now(timezone.utc)
-    results.sort(
-        key=lambda r: r["date"] or datetime.min.replace(tzinfo=timezone.utc)
-    )
+    results.sort(key=lambda r: r["date"] or datetime.min.replace(tzinfo=timezone.utc))
+    s = _summarize(results, errors, now)
 
-    # ── helpers ─────────────────────────────────────────────
-    def _status_html(days, archived):
-        if archived:
-            return '<span class="status archived">📦 Archived</span>'
-        if days > 5*365:
-            return '<span class="status stale">🔴 5+ yrs</span>'
-        if days > 3*365:
-            return '<span class="status old">🟠 3-5 yrs</span>'
-        if days > 365:
-            return '<span class="status aging">🟡 1-3 yrs</span>'
-        return '<span class="status active">🟢 Active</span>'
-
-    def _age_html(days):
-        y, rem = divmod(days, 365)
-        m = rem // 30
-        if y:
-            return f"{y}y {m}m"
-        if m:
-            return f"{m}m"
-        return f"{days}d"
-
-    # ── stats ───────────────────────────────────────────────
-    total_ok = len(results)
-    total_err = len(errors)
-    total = total_ok + total_err
-    total_stars = sum(r.get("stars", 0) for r in results)
-    archived = sum(1 for r in results if r["archived"])
-    active_yr = sum(1 for r in results if r.get("date")
-                    and not r["archived"]
-                    and (now - r["date"]).days <= 365)
-
-    # Health
-    ratio = active_yr / total_ok if total_ok else 0
-    if ratio >= 0.9:
-        health_emoji, health_label, health_class = "🟢", "Excellent", "excellent"
-    elif ratio >= 0.7:
-        health_emoji, health_label, health_class = "🟡", "Fair", "fair"
-    elif ratio >= 0.4:
-        health_emoji, health_label, health_class = "🟠", "Poor", "poor"
-    else:
-        health_emoji, health_label, health_class = "🔴", "Critical", "critical"
-
-    # Counts for summary table
-    cats = [
-        ("Active (< 1 yr)", 0),
-        ("Aging (1-3 yrs)", 0),
-        ("Old (3-5 yrs)", 0),
-        ("Stale (5+ yrs)", 0),
-        ("Archived", 0),
-    ]
-    for r in results:
-        if r["archived"]:
-            cats[4] = (cats[4][0], cats[4][1] + 1)
-        elif r["date"]:
-            d = (now - r["date"]).days
-            if d > 5*365:
-                cats[3] = (cats[3][0], cats[3][1] + 1)
-            elif d > 3*365:
-                cats[2] = (cats[2][0], cats[2][1] + 1)
-            elif d > 365:
-                cats[1] = (cats[1][0], cats[1][1] + 1)
-            else:
-                cats[0] = (cats[0][0], cats[0][1] + 1)
-
-    # ── build rows data ──────────────────────────────────────
+    # ── rows for the client-side table ────────────────────────────
     rows_data = []
     for i, r in enumerate(results, 1):
-        if r["date"]:
-            d = (now - r["date"]).days
-            ds = r["date"].strftime("%Y-%m-%d")
-            age = _age_html(d)
-            st_html = _status_html(d, r["archived"])
-            st_sort = "archived" if r["archived"] else (
-                "stale" if d > 5*365 else
-                "old" if d > 3*365 else
-                "aging" if d > 365 else "active"
-            )
-        else:
-            ds, age, st_html, st_sort = "N/A", "-", "❓", "unknown"
+        d = _age_days(r, now)
+        bucket = _bucket(r, now)
         rows_data.append({
             "num": i,
-            "name": r["name"],
+            "name": _html.escape(r["name"]),
             "url": r["url"],
-            "date": ds,
-            "age": age,
-            "stars": r["stars"],
-            "status_html": st_html,
-            "status_sort": st_sort,
+            "date": f"{r['date']:%Y-%m-%d}" if d is not None else "",
+            "age": _age_str(d) if d is not None else "–",
+            "days": d if d is not None else -1,   # numeric, for sorting
+            "stars": r.get("stars", 0),
+            "bucket": bucket,
+            "label": _BUCKET_LABEL[bucket],
         })
+    rows_json = json.dumps(rows_data, ensure_ascii=False).replace("</", "<\\/")
 
-    # ── build error rows ─────────────────────────────────────
-    err_rows = "".join(
-        f"<tr><td>{i}</td><td><a href='{e['url']}' target='_blank'>{e['name']}</a></td>"
-        f"<td class='err-msg'>{e['error']}</td></tr>"
-        for i, e in enumerate(errors, 1)
+    # ── distribution bar ──────────────────────────────────────────
+    bar = "".join(
+        f'<i class="{key}" style="width:{s["counts"][key] / s["total_ok"] * 100:.4f}%"></i>'
+        for key, _, _ in STATUS_BUCKETS if s["counts"][key]
+    ) if s["total_ok"] else ""
+
+    legend = "".join(
+        f'<span><span class="dot {key}"></span>{label} {rng}</span>'
+        for key, label, rng in STATUS_BUCKETS
     )
 
-    # ── build summary rows ───────────────────────────────────
-    ok_total = sum(c[1] for c in cats)
-    summary_rows = "".join(
-        f"<tr><td>{name}</td><td>{count}</td>"
-        f"<td>{count/ok_total*100:.1f}%</td></tr>"
-        if ok_total else f"<tr><td>{name}</td><td>{count}</td><td>-</td></tr>"
-        for name, count in cats
-    )
+    # ── stat tiles ────────────────────────────────────────────────
+    def _tile(label, value, unit=""):
+        unit_html = f' <span class="unit">{unit}</span>' if unit else ""
+        return (f'<div class="tile"><dt>{label}</dt>'
+                f'<dd>{value}{unit_html}</dd></div>')
 
-    # ── inline CSS ───────────────────────────────────────────
-    CSS = """*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,Cantarell,sans-serif;background:#1e1e2e;color:#cdd6f4;padding:24px;line-height:1.5}
-.wrap{max-width:1200px;margin:0 auto}
-h1{font-size:1.6rem;color:#b4befe;margin-bottom:4px}
-.sub{color:#a6adc8;font-size:.9rem;margin-bottom:16px}
-.health{display:inline-block;padding:4px 14px;border-radius:20px;font-weight:700;font-size:.85rem}
-.health.excellent{background:#a6e3a1;color:#1e1e2e}
-.health.fair{background:#f9e2af;color:#1e1e2e}
-.health.poor{background:#fab387;color:#1e1e2e}
-.health.critical{background:#f38ba8;color:#1e1e2e}
-.stats{display:flex;gap:16px;flex-wrap:wrap;margin:12px 0 16px;color:#a6adc8;font-size:.85rem}
-.stats span{background:#313244;padding:4px 12px;border-radius:6px}
-.controls{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;align-items:center}
-.controls input,.controls select{padding:7px 10px;border-radius:6px;border:1px solid #45475a;background:#313244;color:#cdd6f4;font-size:.85rem}
-.controls input:focus,.controls select:focus{outline:none;border-color:#89b4fa}
-.controls label{color:#a6adc8;font-size:.85rem}
-table{width:100%;border-collapse:collapse;background:#181825;border-radius:8px;overflow:hidden;margin-bottom:16px}
-th{background:#313244;color:#b4befe;font-weight:600;text-align:left;padding:10px 12px;cursor:pointer;user-select:none;white-space:nowrap;position:relative}
-th:hover{background:#45475a}
-th .arrow{color:#89b4fa;margin-left:4px;font-size:.75rem}
-td{padding:8px 12px;border-bottom:1px solid #313244;font-size:.875rem}
-tr:hover td{background:#2a2a3c}
-a{color:#89b4fa;text-decoration:none}
-a:hover{text-decoration:underline}
-.status{padding:2px 8px;border-radius:4px;font-size:.8rem;white-space:nowrap}
-.status.active{background:#1e3a2f;color:#a6e3a1}
-.status.aging{background:#3a3520;color:#f9e2af}
-.status.old{background:#3a2a1a;color:#fab387}
-.status.stale{background:#3a1a24;color:#f38ba8}
-.status.archived{background:#2a2a3c;color:#a6adc8}
-.num{color:#6c7086;font-size:.8rem;text-align:center;width:36px}
-.stars{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
-.date{white-space:nowrap;font-variant-numeric:tabular-nums}
-h2{color:#b4befe;font-size:1.1rem;margin:20px 0 8px}
-.err-msg{color:#f38ba8}
-.footer{margin-top:24px;padding-top:12px;border-top:1px solid #313244;color:#6c7086;font-size:.8rem;text-align:center}
-.empty{text-align:center;padding:32px;color:#6c7086;font-size:.9rem}
-"""
+    tiles = [
+        _tile("Reachable", f"{s['total_ok']:,}",
+              f"of {s['total']:,}" if s["total_err"] else ""),
+        _tile("Updated &lt; 1 yr", f"{s['ratio']:.0%}"
+              if s["live"] else "–", "of live repos"),
+        _tile("Stars", f"{s['stars']:,}"),
+        _tile("Median age", _age_str(s["median_days"])
+              if s["median_days"] is not None else "–"),
+        _tile("Unreachable", f"{s['total_err']:,}" if s["total_err"] else "0"),
+    ]
 
-    # ── inline JS ────────────────────────────────────────────
-    # We embed the data as JSON, then JS builds the table + sorting/filtering
-    rows_json = json.dumps(rows_data)
-    err_count = total_err
-
-    JS = f"""
-const data = {rows_json};
-let sortCol = null, sortAsc = true;
-
-function render() {{
-    const statusFilter = document.getElementById('statusFilter').value;
-    const searchVal = document.getElementById('searchBox').value.toLowerCase();
-    const tbody = document.getElementById('repoBody');
-
-    // Filter
-    let filtered = data;
-    if (statusFilter !== 'all') {{
-        filtered = filtered.filter(r => r.status_sort === statusFilter);
-    }}
-    if (searchVal) {{
-        filtered = filtered.filter(r =>
-            r.name.toLowerCase().includes(searchVal) ||
-            r.date.includes(searchVal)
-        );
-    }}
-
-    // Sort
-    if (sortCol !== null) {{
-        filtered.sort((a, b) => {{
-            let va, vb;
-            if (sortCol === 'stars') {{ va = a.stars; vb = b.stars; }}
-            else if (sortCol === 'date') {{ va = a.date; vb = b.date; }}
-            else if (sortCol === 'name') {{ va = a.name.toLowerCase(); vb = b.name.toLowerCase(); }}
-            else if (sortCol === 'status') {{ va = a.status_sort; vb = b.status_sort; }}
-            else if (sortCol === 'age') {{
-                va = a.age === '-' ? -1 : parseInt(a.age);
-                vb = b.age === '-' ? -1 : parseInt(b.age);
-            }}
-            else {{ va = a.num; vb = b.num; }}
-            if (va < vb) return sortAsc ? -1 : 1;
-            if (va > vb) return sortAsc ? 1 : -1;
-            return 0;
-        }});
-    }}
-
-    // Build table
-    if (filtered.length === 0) {{
-        tbody.innerHTML = '<tr><td colspan="6" class="empty">No repos match your filter</td></tr>';
-        document.getElementById('resultCount').textContent = '0 / ' + data.length;
-        return;
-    }}
-    document.getElementById('resultCount').textContent = filtered.length + ' / ' + data.length;
-    tbody.innerHTML = filtered.map(r => `
-        <tr>
-            <td class="num">${{r.num}}</td>
-            <td><a href="${{r.url}}" target="_blank">${{r.name}}</a></td>
-            <td class="date">${{r.date}}</td>
-            <td>${{r.age}}</td>
-            <td class="stars">${{r.stars.toLocaleString()}}</td>
-            <td>${{r.status_html}}</td>
-        </tr>
-    `).join('');
-
-    // Update arrows
-    document.querySelectorAll('th .arrow').forEach(a => a.remove());
-    if (sortCol !== null) {{
-        const th = document.getElementById('th-' + sortCol);
-        if (th) {{
-            const arrow = document.createElement('span');
-            arrow.className = 'arrow';
-            arrow.textContent = sortAsc ? ' ▲' : ' ▼';
-            th.appendChild(arrow);
-        }}
-    }}
-}}
-
-function sortBy(col) {{
-    if (sortCol === col) {{ sortAsc = !sortAsc; }}
-    else {{ sortCol = col; sortAsc = true; }}
-    render();
-}}
-
-document.addEventListener('DOMContentLoaded', () => {{
-    document.getElementById('searchBox').addEventListener('input', render);
-    document.getElementById('statusFilter').addEventListener('change', render);
-    render();
-}});
-"""
+    err_section = ""
+    if errors:
+        err_rows = "".join(
+            f'<tr><td class="num muted">{i}</td>'
+            f'<td><a href="{_html.escape(e["url"])}" target="_blank" '
+            f'rel="noopener">{_html.escape(e["name"])}</a></td>'
+            f'<td class="err-kind">{_html.escape(e["error"])}</td></tr>'
+            for i, e in enumerate(errors, 1)
+        )
+        kinds = ", ".join(f"{n}× {_html.escape(k)}"
+                          for k, n in s["error_kinds"].items())
+        err_section = (
+            f'<h2>Unreachable ({len(errors)})</h2>'
+            f'<p class="sub">{kinds}</p>'
+            f'<table><thead class="bar-thead"><tr><th class="num">#</th>'
+            f'<th>Repository</th><th>Error</th></tr></thead>'
+            f'<tbody>{err_rows}</tbody></table>'
+        )
 
     HTML = f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-light="false">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Repository Freshness Report</title>
-<style>{CSS}</style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Repository Freshness · {now:%Y-%m-%d}</title>
+<style>{_CSS}</style>
 </head>
 <body>
 <div class="wrap">
-<h1>📊 Repository Freshness Report</h1>
-<div class="sub">
-    <span class="health {health_class}">{health_emoji} {health_label}</span>
-    &nbsp; Generated: {now.strftime('%Y-%m-%d %H:%M UTC')} &nbsp;·&nbsp; {total} repos
-</div>
+<header>
+  <div>
+    <h1>Repository Freshness</h1>
+    <div class="sub">{s['total']:,} repositories · generated {now:%Y-%m-%d %H:%M} UTC</div>
+  </div>
+  <div class="spacer"></div>
+  <span class="health"><b>{s['health_emoji']}</b> {s['health_label']}</span>
+  <button id="theme" title="Toggle light / dark">Light</button>
+</header>
 
-<div class="stats">
-    <span>⭐ {total_stars:,} total stars</span>
-    <span>📦 {archived} archived</span>
-    <span>⚠️ {total_err} errors</span>
-    <span>📋 <span id="resultCount">{total_ok} / {total_ok}</span> shown</span>
-</div>
+<dl class="tiles">{''.join(tiles)}</dl>
 
-<h2>📋 Summary</h2>
-<table>
-<thead><tr><th>Category</th><th>Count</th><th>Share</th></tr></thead>
-<tbody>{summary_rows}</tbody>
-</table>
+<div class="bar">{bar}</div>
+<div class="legend">{legend}</div>
 
-<h2>📌 Repositories</h2>
-<div class="controls">
-    <label for="searchBox">🔍 Search:</label>
-    <input type="text" id="searchBox" placeholder="Repo name or date…">
-    <label for="statusFilter">Status:</label>
-    <select id="statusFilter">
-        <option value="all">All</option>
-        <option value="active">🟢 Active</option>
-        <option value="aging">🟡 Aging</option>
-        <option value="old">🟠 Old</option>
-        <option value="stale">🔴 Stale</option>
-        <option value="archived">📦 Archived</option>
-    </select>
+<h2 id="repos">Repositories</h2>
+<div class="toolbar">
+  <input type="search" id="search" placeholder="Filter by name or date…"
+         autocomplete="off" autofocus>
+  <select id="filter">
+    <option value="all">All statuses</option>
+    <option value="active">🟢 Active</option>
+    <option value="aging">🟡 Aging</option>
+    <option value="old">🟠 Old</option>
+    <option value="stale">🔴 Stale</option>
+    <option value="archived">📦 Archived</option>
+  </select>
+  <span class="count" id="count"></span>
 </div>
 <table>
-<thead>
-<tr>
-    <th id="th-num" onclick="sortBy('num')" style="width:36px">#<span class="arrow"> ▲</span></th>
-    <th id="th-name" onclick="sortBy('name')">Repository</th>
-    <th id="th-date" onclick="sortBy('date')">Last Commit</th>
-    <th id="th-age" onclick="sortBy('age')">Age</th>
-    <th id="th-stars" onclick="sortBy('stars')">⭐</th>
-    <th id="th-status" onclick="sortBy('status')">Status</th>
-</tr>
-</thead>
-<tbody id="repoBody"></tbody>
+<thead class="bar-thead"><tr>
+  <th class="num" data-key="num">#</th>
+  <th data-key="name">Repository</th>
+  <th class="r" data-key="date">Last commit</th>
+  <th class="r age" data-key="days">Age</th>
+  <th class="r" data-key="stars">Stars</th>
+  <th data-key="label">Status</th>
+</tr></thead>
+<tbody id="body"></tbody>
 </table>
-"""
 
-    if errors:
-        HTML += f"""<h2>⚠️ Errors ({err_count})</h2>
-<table>
-<thead><tr><th>#</th><th>Repository</th><th>Error</th></tr></thead>
-<tbody>{err_rows}</tbody>
-</table>
-"""
+{err_section}
 
-    HTML += f"""<div class="footer">
-Repo Freshness Checker v{VERSION} &nbsp;·&nbsp; Generated {now.strftime('%Y-%m-%d %H:%M UTC')}
+<footer>Repo Freshness Checker v{VERSION} · buckets by age of last push:
+🟢 &lt; 1 yr · 🟡 1-3 yrs · 🟠 3-5 yrs · 🔴 &gt; 5 yrs · 📦 archived</footer>
 </div>
-</div>
-<script>{JS}</script>
+<script>window.__ROWS__ = {rows_json};</script>
+<script>{_JS}</script>
 </body>
-</html>"""
-
+</html>
+"""
     Path(path).write_text(HTML, encoding="utf-8")
 
 
@@ -887,9 +992,13 @@ def run_gui():
             self.minsize(720, 520)
             self.cancel_event = threading.Event()
             self.running = False
-            self.last_results = None
-            self.last_errors = None
             self.input_files: list[str] = []
+            # Token state: "value verified ok" + last result, so a check run
+            # doesn't have to re-verify an unchanged token.
+            self.tok_ok: str | None = None
+            self.tok_info: dict | None = None
+            self._verify_job: str | None = None
+            self._live_ok = self._live_err = 0
 
             # Apply dark theme
             style = ttk.Style(self)
@@ -904,9 +1013,12 @@ def run_gui():
             self._tk_config()
 
             self._build()
+            self._setup_keys()
+            self._setup_drag_drop()
             saved = load_token()
             if saved:
                 self.tok_var.set(saved)
+                self.after(200, self._verify_token)
             self._load_config()
 
         def _tk_config(self):
@@ -957,19 +1069,28 @@ def run_gui():
             self.eye_btn = ttk.Button(row0, text="Show", width=5,
                                       command=self._toggle_tok)
             self.eye_btn.pack(side="left", padx=1)
+            self.verify_btn = ttk.Button(row0, text="Verify", width=7,
+                                         command=self._verify_token)
+            self.verify_btn.pack(side="left", padx=1)
             ttk.Button(row0, text="Save", width=5,
                        command=self._save_tok).pack(side="left", padx=1)
             ttk.Button(row0, text="Clear", width=5,
                        command=self._clear_tok).pack(side="left", padx=1)
+            # Re-check once typing settles, so the badge is never stale.
+            self.tok_var.trace_add("write", self._on_tok_typed)
 
-            # Clickable token link row
+            # Token status + help link
             row1 = ttk.Frame(tf)
             row1.pack(fill="x", pady=(6, 0))
+            self.tok_status = tk.Label(row1, text="Not verified",
+                                       fg=Palette.SUBTEXT, bg=Palette.BG,
+                                       anchor="w", font=("sans-serif", 9))
+            self.tok_status.pack(side="left", fill="x", expand=True)
             link_lbl = tk.Label(row1,
-                text="🔑 Generate a token (no scopes needed for public repos)",
+                text="Generate a token ↗",
                 fg=Palette.ACCENT, bg=Palette.BG,
                 cursor="hand2", font=("sans-serif", 9))
-            link_lbl.pack(side="left")
+            link_lbl.pack(side="right")
             link_lbl.bind("<Button-1>", lambda e: webbrowser.open(
                 "https://github.com/settings/tokens"))
             link_lbl.bind("<Enter>", lambda e: link_lbl.configure(
@@ -996,22 +1117,33 @@ def run_gui():
             ttk.Button(fi0, text="Choose folder…",
                        command=self._browse_in).pack(side="left")
 
-
-
             # Output
             fi1 = ttk.Frame(ff)
             fi1.pack(fill="x", pady=(8, 0))
             ttk.Label(fi1, text="Output file:").pack(side="left")
             self.out_var = tk.StringVar(value="freshness_report.md")
-            tk.Entry(fi1, textvariable=self.out_var,
-                     bg=Palette.SURF_ALT, fg=Palette.TEXT,
-                     insertbackground=Palette.TEXT,
-                     relief="flat", highlightthickness=1,
-                     highlightbackground=Palette.BORDER,
-                     highlightcolor=Palette.ACCENT).pack(
-                         side="left", fill="x", expand=True, padx=6)
+            self.out_entry = tk.Entry(fi1, textvariable=self.out_var,
+                                      bg=Palette.SURF_ALT, fg=Palette.TEXT,
+                                      insertbackground=Palette.TEXT,
+                                      relief="flat", highlightthickness=1,
+                                      highlightbackground=Palette.BORDER,
+                                      highlightcolor=Palette.ACCENT)
+            self.out_entry.pack(side="left", fill="x", expand=True, padx=6)
             ttk.Button(fi1, text="Browse…",
                        command=self._browse_out).pack(side="left")
+
+            fi2 = ttk.Frame(ff)
+            fi2.pack(fill="x", pady=(8, 0))
+            ttk.Label(fi2, text="Format:").pack(side="left")
+            self.fmt_var = tk.StringVar(value="both")
+            ttk.Radiobutton(fi2, text="Markdown", value="md",
+                            variable=self.fmt_var).pack(side="left")
+            ttk.Radiobutton(fi2, text="HTML", value="html",
+                            variable=self.fmt_var).pack(side="left", padx=6)
+            ttk.Radiobutton(fi2, text="Both", value="both",
+                            variable=self.fmt_var).pack(side="left")
+            ttk.Label(fi2, text="   HTML gets an interactive filter and sort",
+                      foreground=Palette.SUBTEXT).pack(side="left")
 
             # ── Controls ──────────────────────────────────────
             cf = ttk.Frame(main)
@@ -1031,11 +1163,6 @@ def run_gui():
                 cf, text="📂 Open Report", command=self._open_report,
                 state="disabled")
             self.open_btn.pack(side="left")
-
-            self.html_btn = ttk.Button(
-                cf, text="🌐 Export HTML", command=self._export_html,
-                state="disabled")
-            self.html_btn.pack(side="left", padx=6)
 
             ttk.Label(cf, text="Workers:").pack(side="left", padx=(24, 2))
             self.workers_var = tk.IntVar(value=DEFAULT_WORKERS)
@@ -1142,6 +1269,16 @@ def run_gui():
             except (tk.TclError, OSError):
                 pass
 
+        # ── keyboard shortcuts ───────────────────────────────
+        def _setup_keys(self):
+            self.bind("<Control-o>", lambda e: self._browse_in())
+            self.bind("<Control-s>", lambda e: self._save_tok())
+            self.bind("<Control-Return>", lambda e: self._start())
+            self.bind("<Escape>", lambda e: self._stop())
+            # Enter in the output field is the common "I'm done, run it".
+            self.out_entry.bind("<Return>", lambda e: self._start())
+            self.tok_entry.bind("<Return>", lambda e: self._verify_token())
+
         # ── config persistence ────────────────────────────────
         CONFIG_FILE = CONFIG_DIR / "gui_config.json"
 
@@ -1164,6 +1301,8 @@ def run_gui():
                         self.out_var.set(data["last_output"])
                     if "last_workers" in data:
                         self.workers_var.set(data["last_workers"])
+                    if "last_format" in data:
+                        self.fmt_var.set(data["last_format"])
             except (json.JSONDecodeError, OSError):
                 pass
 
@@ -1180,33 +1319,86 @@ def run_gui():
             except OSError:
                 pass
 
-        # ── callbacks ─────────────────────────────────────────
+        # ── token ──────────────────────────────────────────────
         def _toggle_tok(self):
             self._show_tok = not self._show_tok
             self.tok_entry.config(show="" if self._show_tok else "●")
             self.eye_btn.config(text="Hide" if self._show_tok else "Show")
 
+        def _on_tok_typed(self, *_):
+            """Debounce: check the token shortly after typing stops."""
+            typed = self.tok_var.get().strip()
+            if typed == (self.tok_ok or ""):
+                return
+            self.tok_ok = None
+            self._set_tok_status("Not verified", Palette.SUBTEXT)
+            if self._verify_job:
+                self.after_cancel(self._verify_job)
+            if not typed:
+                self._set_tok_status(
+                    "No token - unauthenticated (60 requests/hour)",
+                    Palette.YELLOW)
+                return
+            self._verify_job = self.after(1200, self._verify_token)
+
+        def _set_tok_status(self, text: str, color: str):
+            self.tok_status.config(text=text, fg=color)
+
+        def _verify_token(self, event=None):
+            """Ask GitHub whether the token actually works (off-thread)."""
+            token = self.tok_var.get().strip()
+            self._verify_job = None
+            if not token:
+                self._set_tok_status(
+                    "No token - unauthenticated (60 requests/hour)",
+                    Palette.YELLOW)
+                return None
+            self.verify_btn.config(state="disabled", text="Checking")
+            self._set_tok_status("Checking token with GitHub …", Palette.SUBTEXT)
+            threading.Thread(target=self._verify_worker, args=(token,),
+                             daemon=True).start()
+            return None
+
+        def _verify_worker(self, token: str):
+            info = check_token(token)
+            self.after(0, lambda: self._apply_token_info(info, token))
+
+        def _apply_token_info(self, info: dict, token: str | None = None):
+            self.verify_btn.config(state="normal", text="Verify")
+            # Ignore a result that arrived after the field changed again.
+            if token is not None and token != self.tok_var.get().strip():
+                return
+            self.tok_info = info
+            self.tok_ok = token if info["ok"] else None
+            color = {"ok": Palette.GREEN, "warn": Palette.YELLOW,
+                     "error": Palette.RED}[info["level"]]
+            prefix = {"ok": "✓", "warn": "⚠", "error": "✗"}[info["level"]]
+            msg = f"{prefix} {info['message']}"
+            if info["ok"] and info["limit"]:
+                msg += f" · {info['limit']:,} requests/hour"
+            self._set_tok_status(msg, color)
+
         def _save_tok(self):
             t = self.tok_var.get().strip()
             if not t:
-                messagebox.showwarning("Token", "Enter a token first.")
+                self._set_tok_status("Nothing to save", Palette.YELLOW)
                 return
-            # Validate token format before saving
-            is_valid, msg = validate_token(t)
-            if not is_valid:
-                if not messagebox.askyesno("Token Warning",
-                        f"{msg}.\n\nSave anyway?"):
-                    return
+            # Only accept a token GitHub has confirmed, so a typo can't be
+            # persisted and silently break the next run.
+            if self.tok_ok != t:
+                self._verify_token()
+                messagebox.showinfo(
+                    "Verifying token",
+                    "Checking the token with GitHub first — save it once "
+                    "it comes back valid.")
+                return
             save_token(t)
-            messagebox.showinfo("Token Saved",
-                f"Token saved securely.\n"
-                f"Location: {TOKEN_FILE}\n\n"
-                "Note: Token is stored in plaintext.\n"
-                "Use 'Clear' to remove it from disk when done.")
+            self._set_tok_status(f"✓ Saved to {TOKEN_FILE}", Palette.GREEN)
 
         def _clear_tok(self):
             self.tok_var.set("")
             clear_saved_token()
+            self._set_tok_status("Token removed", Palette.SUBTEXT)
 
         def _browse_in(self):
             folder = filedialog.askdirectory(title="Select folder containing Markdown files")
@@ -1228,47 +1420,51 @@ def run_gui():
                 self.in_var.set("")
 
         def _browse_out(self):
+            fmt = self.fmt_var.get()
+            if fmt == "html":
+                types, ext = [("HTML", "*.html")], ".html"
+            elif fmt == "both":
+                types, ext = [("Markdown", "*.md"), ("HTML", "*.html")], ".md"
+            else:
+                types, ext = [("Markdown", "*.md")], ".md"
             p = filedialog.asksaveasfilename(
                 title="Save report as",
-                defaultextension=".md",
-                filetypes=[("Markdown", "*.md")])
+                defaultextension=ext,
+                filetypes=types)
             if p:
                 self.out_var.set(p)
 
-        def _open_report(self):
-            p = self.out_var.get()
-            if not Path(p).exists():
-                return
-            import subprocess, platform
-            s = platform.system()
-            if s == "Darwin":
-                subprocess.Popen(["open", p])
-            elif s == "Windows":
-                os.startfile(p)
-            else:
-                subprocess.Popen(["xdg-open", p])
+        def _report_paths(self, fmt: str | None = None) -> list[str]:
+            """Paths to write for the chosen format, in display order."""
+            fmt = fmt or self.fmt_var.get()
+            out = self.out_var.get().strip()
+            base = Path(out).with_suffix("")
+            if fmt == "html":
+                return [str(base) + ".html"]
+            if fmt == "both":
+                return [str(base) + ".md", str(base) + ".html"]
+            return [out]
 
-        def _export_html(self):
-            """Open the companion HTML report (auto-generated alongside .md)."""
-            md_path = self.out_var.get()
-            html_path = str(Path(md_path).with_suffix('.html'))
-            if not Path(html_path).exists():
-                # Regenerate from stored data if available
-                results = getattr(self, 'last_results', None)
-                errors = getattr(self, 'last_errors', None)
-                if results is not None and errors is not None:
-                    generate_html_report(results, errors, html_path)
-                else:
-                    messagebox.showerror("Error", "No report data available. Run a check first.")
-                    return
+        def _open_report(self):
+            fmt = self.fmt_var.get()
+            paths = self._report_paths(fmt)
+            existing = [p for p in paths if Path(p).exists()]
+            if not existing:
+                messagebox.showerror(
+                    "No report",
+                    f"Report not found at:\n{paths[0]}\n\n"
+                    "Run a check first.")
+                return
+            # Prefer the HTML report - it is the interactive one.
+            target = existing[-1]
             import subprocess, platform
             s = platform.system()
             if s == "Darwin":
-                subprocess.Popen(["open", html_path])
+                subprocess.Popen(["open", target])
             elif s == "Windows":
-                os.startfile(html_path)
+                os.startfile(target)
             else:
-                subprocess.Popen(["xdg-open", html_path])
+                subprocess.Popen(["xdg-open", target])
 
         def _log(self, msg: str):
             """Log with automatic tag detection based on emoji prefixes."""
@@ -1285,7 +1481,11 @@ def run_gui():
             elif msg.startswith("🔑") or msg.startswith("⚙"):
                 tag = "accent"
             elif msg.startswith("["):
-                # Line like "[1/523] ✅ ..."
+                # Line like "[1/523] ✅ …" - keep the running tallies.
+                if "✅" in msg:
+                    self._live_ok += 1
+                elif "❌" in msg:
+                    self._live_err += 1
                 tag = "info"
             if tag:
                 self.log.insert("end", msg + "\n", tag)
@@ -1297,19 +1497,24 @@ def run_gui():
         def _progress(self, cur, total, dyn_info=None):
             pct = cur / total * 100 if total else 0
             self.prog["value"] = pct
-            label = f"  {cur} / {total}  ({pct:.1f}%)"
+            ok, err = getattr(self, "_live_ok", 0), getattr(self, "_live_err", 0)
+            label = f"  {cur} / {total}"
             if dyn_info and dyn_info.get("eta", 0) > 0:
                 eta = dyn_info["eta"]
                 if eta >= 3600:
-                    label += f"  ⏱ ETA: {eta/3600:.1f}h"
+                    label += f"  ·  ETA {eta/3600:.0f}h"
                 elif eta >= 60:
-                    label += f"  ⏱ ETA: {eta/60:.0f}m"
+                    label += f"  ·  ETA {eta/60:.0f}m"
                 else:
-                    label += f"  ⏱ ETA: {eta:.0f}s"
+                    label += f"  ·  ETA {eta:.0f}s"
+            if ok or err:
+                label += f"  ·  ✓{ok} ✗{err}"
             self.prog_lbl.config(text=label)
 
         # ── threaded work ─────────────────────────────────────
         def _start(self):
+            if self.running:
+                return
             inp = list(self.input_files)
             if not inp:
                 typed_input = self.in_var.get().strip()
@@ -1318,52 +1523,83 @@ def run_gui():
             out = self.out_var.get().strip()
             tok = self.tok_var.get().strip()
             if not inp or any(not Path(path).is_file() for path in inp):
-                messagebox.showerror("Error", "Select valid input files or a folder containing Markdown files.")
+                messagebox.showerror(
+                    "No input",
+                    "Pick a folder containing Markdown files (or type a "
+                    "file path) first.")
+                self.in_entry.focus_set()
                 return
             if not out:
-                messagebox.showerror("Error", "Specify an output file.")
+                messagebox.showerror("No output", "Specify an output file.")
+                self.out_entry.focus_set()
                 return
-            if not tok:
-                if not messagebox.askyesno(
-                    "No token",
-                    "Without a token the rate limit is 60 req/hr.\n"
-                    "For 500+ repos this will take hours.\n\nContinue anyway?"
-                ):
-                    return
 
             self.running = True
             self.cancel_event.clear()
+            self._live_ok = self._live_err = 0
             self.start_btn.config(state="disabled")
             self.stop_btn.config(state="normal")
             self.open_btn.config(state="disabled")
-            self.html_btn.config(state="disabled")
             self.log.config(state="normal")
             self.log.delete("1.0", "end")
             self.log.config(state="disabled")
-            self.status_var.set("Extracting URLs …")
+            self.prog["value"] = 0
+            self.prog_lbl.config(text="  0 / 0")
+            self.status_var.set("Checking token …")
 
-            t = threading.Thread(target=self._worker,
-                                 args=(inp, out, tok), daemon=True)
-            t.start()
+            # Resolve output paths here: the worker thread must not touch
+            # Tk variables.
+            threading.Thread(
+                target=self._worker, args=(inp, tok, self._report_paths()),
+                daemon=True).start()
 
         def _stop(self):
+            if not self.running:
+                return
             self.cancel_event.set()
             self.stop_btn.config(state="disabled")
             self.status_var.set("Cancelling …")
 
-        def _worker(self, inp, out, tok):
+        def _worker(self, inp, tok, out_paths):
             try:
+                # ── token preflight ──────────────────────────
+                # Fail fast and loudly rather than reporting every repo as
+                # "Forbidden" once an invalid token is used.
+                self._safe_log("🔑 Checking token …")
+                info = check_token(tok)
+                self.after(0, lambda i=info: self._apply_token_info(i))
+                if not info["ok"] and tok:
+                    self._safe_log(f"❌ {info['message']}")
+                    self._safe_status("Token rejected by GitHub")
+                    self.after(0, lambda i=info: messagebox.showerror(
+                        "Invalid GitHub token", i["message"]))
+                    return
+                if tok and info["limit"]:
+                    self._safe_log(
+                        f"✅ {info['message']} · "
+                        f"{info['limit']:,} requests/hour")
+                elif tok:
+                    self._safe_log(f"✅ {info['message']}")
+                else:
+                    self._safe_log(
+                        f"⚠  {info['message']} — this will be slow for "
+                        f"long lists")
+
+                # ── input ────────────────────────────────────
                 self._safe_log(f"📂 Reading {len(inp)} input file(s) …")
                 repos = extract_repos(expand_input_paths(inp))
                 self._safe_log(f"🔍 Found {len(repos)} unique GitHub repos")
                 if not repos:
-                    self._safe_status("No repos found.")
-                    self._finish()
+                    self._safe_status("No GitHub URLs found in the input.")
+                    self.after(0, lambda: messagebox.showwarning(
+                        "Nothing to check",
+                        "No github.com links were found in the selected "
+                        "files."))
                     return
 
                 workers = self.workers_var.get()
-                self._safe_log(f"⚙  Using {workers} concurrent workers")
-                self._safe_status("Checking repos …")
+                self._safe_log(f"⚙  {workers} concurrent workers")
+                self._safe_status(f"Checking {len(repos)} repositories …")
                 results, errors = process_repos(
                     repos, tok,
                     progress_cb=self._safe_progress,
@@ -1372,24 +1608,23 @@ def run_gui():
                     max_workers=workers,
                 )
 
-                # Store for HTML export
-                self.after(0, lambda: setattr(self, 'last_results', results))
-                self.after(0, lambda: setattr(self, 'last_errors', errors))
-
-                if results or errors:
-                    generate_report(results, errors, out)
-                    # Also generate HTML companion file alongside the .md
-                    html_path = str(Path(out).with_suffix('.html'))
-                    generate_html_report(results, errors, html_path)
-                    self._safe_log(f"\n📝 Report saved → {out}")
-                    self._safe_log(f"🌐 HTML report → {html_path}")
-                    self._safe_log(
-                        f"   ✅ {len(results)} repos  |  ❌ {len(errors)} errors")
-                    self._safe_status(f"Done - report saved to {out}")
-                    self.after(0, lambda: self.open_btn.config(state="normal"))
-                    self.after(0, lambda: self.html_btn.config(state="normal"))
-                else:
+                if not results and not errors:
                     self._safe_status("Nothing to report.")
+                    return
+
+                for path in out_paths:
+                    if path.endswith(".html"):
+                        generate_html_report(results, errors, path)
+                    else:
+                        generate_report(results, errors, path)
+                    self._safe_log(f"📝 Saved → {path}")
+                self._safe_log(
+                    f"   ✅ {len(results)} reachable  |  "
+                    f"❌ {len(errors)} unreachable")
+                self._safe_status(
+                    f"Done — {len(results)} of {len(results) + len(errors)} "
+                    f"repos reported")
+                self.after(0, lambda: self.open_btn.config(state="normal"))
             except Exception as exc:
                 self._safe_log(f"\n💥 ERROR: {exc}")
                 self._safe_status(f"Error: {exc}")
@@ -1442,55 +1677,101 @@ def run_cli():
     args = ap.parse_args()
 
     token = args.token or load_token()
+
+    # ── token preflight ────────────────────────────────────────
+    # A bad token makes every repo fail with a bare "Forbidden", so verify
+    # it up front and say exactly what is wrong.
+    print("🔑  Checking token …")
+    info = check_token(token)
+    if not info["ok"] and token:
+        print(f"\n✗  {info['message']}", file=sys.stderr)
+        if args.token:
+            print(f"   Supplied via --token (length {len(args.token)}).",
+                  file=sys.stderr)
+        else:
+            print(f"   Read from {TOKEN_FILE} or $GITHUB_TOKEN.",
+                  file=sys.stderr)
+        print("   Run without a token to check public repos unauthenticated "
+              "(60 requests/hour).", file=sys.stderr)
+        sys.exit(2)
     if args.save_token and args.token:
         save_token(args.token)
-        print(f"✓ Token saved to {TOKEN_FILE}")
-
-    if not token:
-        print("⚠  No token - rate limit is 60 req/hr.  "
-              "Pass --token or set GITHUB_TOKEN.")
+        print(f"✓  Token saved to {TOKEN_FILE}")
+    if info["ok"]:
+        print(f"✓  {info['message']}"
+              + (f"  ·  {info['limit']:,} requests/hour"
+                 if info["limit"] else ""))
+    else:
+        print(f"⚠  {info['message']}")
 
     expanded = expand_input_paths(args.input_file)
     repos = extract_repos(expanded)
-    print(f"🔍  Found {len(repos)} unique GitHub repos in {len(expanded)} input file(s)")
+    print(f"🔍  Found {len(repos)} unique GitHub repos in "
+          f"{len(expanded)} input file(s)")
     if not repos:
         sys.exit(0)
 
     print(f"⚙  Using {args.workers} concurrent workers")
     start = time.time()
 
-    def _cli_progress(cur, total, dyn_info=None):
-        pct = cur / total * 100 if total else 0
-        label = f"  Progress: {cur}/{total}  ({pct:.1f}%)"
-        if dyn_info and dyn_info.get("eta", 0) > 0:
-            eta = dyn_info["eta"]
-            if eta >= 3600:
-                label += f"  ETA: {eta/3600:.1f}h"
-            elif eta >= 60:
-                label += f"  ETA: {eta/60:.0f}m"
+    # Progress owns the current terminal line; log lines have to wipe it
+    # first, otherwise the two overwrite each other into noise.
+    class _Progress:
+        width = 0
+        bucket = -1
+
+        def __call__(self, cur, total, dyn_info=None):
+            pct = cur / total * 100 if total else 0
+            label = f"  {cur}/{total} ({pct:.0f}%)"
+            if dyn_info and dyn_info.get("eta", 0) > 0:
+                eta = dyn_info["eta"]
+                label += (f"  ETA {eta/3600:.0f}h" if eta >= 3600
+                          else f"  ETA {eta/60:.0f}m" if eta >= 60
+                          else f"  ETA {eta:.0f}s")
+            if sys.stdout.isatty():
+                self.clear()
+                sys.stdout.write(label)
+                sys.stdout.flush()
+                self.width = len(label)
             else:
-                label += f"  ETA: {eta:.0f}s"
-        print(f"\r{label:<72}", end="", flush=True)
+                # Piped output: no carriage returns, one line per 10%.
+                step = int(pct // 10)
+                if step != self.bucket:
+                    self.bucket = step
+                    print(label)
+
+        def clear(self):
+            if self.width:
+                sys.stdout.write("\r" + " " * self.width + "\r")
+                sys.stdout.flush()
+                self.width = 0
+
+    progress = _Progress()
+
+    def _cli_log(msg: str):
+        progress.clear()
+        print(msg)
 
     results, errors = process_repos(
         repos, token,
-        progress_cb=_cli_progress,
-        log_cb=lambda m: print(f"\r{m:<80}"),
+        progress_cb=progress,
+        log_cb=_cli_log,
         max_workers=args.workers,
     )
     elapsed = time.time() - start
-    print()
+    progress.clear()
 
     generate_report(results, errors, args.output)
-    print(f"\n📝  Report saved → {args.output}")
+    print(f"📝  Report saved → {args.output}")
 
     if args.format in ("html", "both"):
         html_path = str(Path(args.output).with_suffix('.html'))
         generate_html_report(results, errors, html_path)
         print(f"🌐  HTML report  → {html_path}")
 
-    print(f"    ✅ {len(results)} repos  |  ❌ {len(errors)} errors  "
-          f"|  ⏱ {elapsed:.1f}s")
+    print(f"    ✅ {len(results)} reachable  |  ❌ {len(errors)} unreachable"
+          f"  |  ⏱ {elapsed:.1f}s")
+    sys.exit(1 if errors and not results else 0)
 
 # ════════════════════════ entry point ═══════════════════════════
 if __name__ == "__main__":
