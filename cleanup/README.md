@@ -23,21 +23,30 @@ Get your Account ID: Cloudflare dashboard → right sidebar on any domain/accoun
 ## Usage
 
 ```fish
-bun run cf-pages-cleanup.ts
+# Preview
+bun run cf-pages-cleanup.ts -p awesome-android-root --dry-run
+
+# Delete, with 5 parallel jobs
+bun run cf-pages-cleanup.ts -p awesome-android-root -j 5
 ```
 
-By default this targets the `awesome-android-root` project and keeps the 5 most recent deployments. To change either, edit these lines near the top of the script:
+Flags:
+
+- `-p, --project <name>` - Pages project name (default `awesome-android-root`)
+- `-j, --jobs <count>` - number of deletions to run concurrently (default `5`)
+- `--dry-run` - list what would be deleted without deleting
+
+The script keeps the 5 most recent deployments (plus the live production deployment). To change that, edit `KEEP` near the top of the script:
 
 ```ts
-const PROJECT = "awesome-android-root";
 const KEEP = 5;
 ```
 
 ## Notes
 
-- Deletion uses `force=true`, so it also removes deployments with active aliases (e.g. production/preview URLs pointing at them). Remove `force=true` in `deleteDeployment` if you'd rather have it skip those.
+- Deletion uses `force=true`, so it also removes preview deployments with active aliases (e.g. branch URLs pointing at them).
+- The live production deployment is never deleted, even if it falls outside the newest N deployments.
 - The script paginates through all deployments before deciding what to delete, so it works regardless of how many exist.
-- No dry-run mode currently. Test on a low-stakes project first if unsure.
 
 ## Troubleshooting
 
