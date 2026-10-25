@@ -68,6 +68,10 @@ type ApiResponse<T> = {
   errors?: { message: string }[];
 };
 
+function formatDeployment(d: Deployment): string {
+  return `${d.id.slice(0, 8).padEnd(8)}  ${d.created_on.slice(0, 10)}  ${d.environment.padEnd(10)}  ${d.url}`;
+}
+
 async function listAll(): Promise<Deployment[]> {
   const all: Deployment[] = [];
   let page = 1;
@@ -100,10 +104,10 @@ async function deleteAll(deployments: Deployment[]): Promise<number> {
       const d = deployments[index++];
       const error = await deleteDeployment(d.id);
       if (error) {
-        console.log(`Failed ${d.id} (${d.created_on}, ${d.environment}): ${error}`);
+        console.error(`  FAILED   ${formatDeployment(d)}\n  ${error}`);
       } else {
         deleted++;
-        console.log(`Deleted ${d.id} (${d.created_on}, ${d.environment})`);
+        console.log(`  deleted  ${formatDeployment(d)}`);
       }
     }
   }
@@ -130,7 +134,7 @@ async function main() {
     .slice(KEEP)
     .filter((d) => d.id !== liveProduction?.id);
 
-  console.log(`Found ${deployments.length} deployments. Keeping ${KEEP} most recent.`);
+  console.log(`Found ${deployments.length} deployments. Keeping ${Math.min(KEEP, deployments.length)} most recent.`);
 
   if (toDelete.length === 0) {
     console.log("Nothing to delete.");
@@ -138,18 +142,20 @@ async function main() {
   }
 
   if (DRY_RUN) {
-    for (const d of toDelete) {
-      console.log(`Would delete ${d.id} (${d.created_on}, ${d.environment}) ${d.url}`);
-    }
-    console.log(`Dry run: ${toDelete.length} deployments would be deleted.`);
+    const count = toDelete.length;
+    console.log(`Would delete ${count} deployment${count === 1 ? "" : "s"}:`);
+    for (const d of toDelete) console.log(`  ${formatDeployment(d)}`);
+    console.log("Dry run: nothing deleted.");
     return;
   }
 
-  console.log(`Deleting with ${Math.min(JOBS, toDelete.length)} parallel jobs.`);
+  const jobs = Math.min(JOBS, toDelete.length);
+  console.log(`Deleting ${toDelete.length} deployment${toDelete.length === 1 ? "" : "s"}, ${jobs} at a time...`);
   const deleted = await deleteAll(toDelete);
+  const failed = toDelete.length - deleted;
 
-  console.log(`Cleanup complete. Deleted ${deleted}/${toDelete.length} deployments.`);
-  if (deleted !== toDelete.length) process.exitCode = 1;
+  console.log(`Cleanup complete: ${deleted} deleted${failed ? `, ${failed} failed` : ""}.`);
+  if (failed) process.exitCode = 1;
 }
 
 main().catch((err) => {
