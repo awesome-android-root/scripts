@@ -248,7 +248,7 @@ async function main() {
   console.log(`Keeping ${bold(String(deployments.length - toDelete.length))}, deleting ${bold(String(toDelete.length))}`);
 
   if (toDelete.length === 0) {
-    console.log(green("Nothing to delete — already within the keep limit."));
+    console.log(green("Nothing to delete: already within the keep limit."));
     return;
   }
 
@@ -256,7 +256,7 @@ async function main() {
     console.log(dim(TABLE_HEADER));
     for (const d of deployments) {
       const row = formatDeployment(d, now);
-      const tag = keepIds.has(d.id) ? dim(pad("keep", TAG_WIDTH)) : yellow(pad("DELETE", TAG_WIDTH));
+      const tag = keepIds.has(d.id) ? dim(pad("keep", TAG_WIDTH)) : yellow(pad("delete", TAG_WIDTH));
       console.log(tag + (keepIds.has(d.id) ? dim(row) : row));
     }
     console.log(`Dry run: nothing deleted.`);
