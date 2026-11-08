@@ -44,6 +44,7 @@ const KEEP = 5;
 
 ## Notes
 
+- Output is colored when attached to a terminal; piped output (CI, logs) is plain. Set `NO_COLOR` to disable colors explicitly.
 - Deletion uses `force=true`, so it also removes preview deployments with active aliases (e.g. branch URLs pointing at them).
 - The live production deployment is never deleted, even if it falls outside the newest N deployments.
 - The script paginates through all deployments before deciding what to delete, so it works regardless of how many exist.
