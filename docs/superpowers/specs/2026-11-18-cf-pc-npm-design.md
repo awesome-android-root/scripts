@@ -76,9 +76,10 @@ cleanup/
 - `repository` pointing at `awesome-android-root/scripts`, `directory: "cleanup"`.
 - `keywords`: cloudflare, pages, deployments, cleanup, cli.
 - `scripts.build`: `bun build ./cf-pages-cleanup.ts --target=node --outfile=dist/cf-pc.js`.
-- `scripts.prepack`: run `build`, then execute `dist/cf-pc.js --help` as a
-  smoke check. This runs on `npm pack` and `npm publish`, so a stale or broken
-  artifact cannot be shipped.
+- `scripts.prepack`: `npm run test:dist` — build, then the `dist/cf-pc.js`
+  tests (version, help, missing project, Node shebang). This runs on
+  `npm pack` and `npm publish`, so a stale or broken artifact cannot be
+  shipped.
 
 ### CLI changes in `cf-pages-cleanup.ts`
 
