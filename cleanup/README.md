@@ -1,14 +1,29 @@
-# cf-pages-cleanup
+# cf-pc
 
 Deletes old Cloudflare Pages deployments for a project, keeping only the N most recent.
 
-## Requirements
+## Install
 
-- [Bun](https://bun.sh)
-- A Cloudflare API token with **Pages: Edit** permission
-- Your Cloudflare Account ID
+```bash
+npm i -g cf-pc
+```
 
-## Setup (fish shell)
+or, with Bun:
+
+```bash
+bun add -g cf-pc
+```
+
+Requires Node 26+ (for native TypeScript) or Bun.
+
+## Credentials
+
+`cf-pc` needs two environment variables:
+
+- `CF_API_TOKEN` - a Cloudflare API token with **Pages: Edit** permission. Get it from the Cloudflare dashboard → My Profile → API Tokens → Create Token.
+- `CF_ACCOUNT_ID` - your Cloudflare Account ID. Get it from the Cloudflare dashboard → right sidebar on any domain/account page.
+
+Set them in fish:
 
 ```fish
 set -x CF_API_TOKEN your_token_here
@@ -17,40 +32,54 @@ set -x CF_ACCOUNT_ID your_account_id_here
 
 To persist across sessions, add these to `~/.config/fish/config.fish`.
 
-Get your API token: Cloudflare dashboard → My Profile → API Tokens → Create Token.
-Get your Account ID: Cloudflare dashboard → right sidebar on any domain/account page.
-
 ## Usage
 
-```fish
-# Preview
-bun run cf-pages-cleanup.ts -p awesome-android-root --dry-run
+```bash
+# Preview what would be deleted
+cf-pc -p awesome-android-root --dry-run
 
-# Delete, with 5 parallel jobs
-bun run cf-pages-cleanup.ts -p awesome-android-root -j 5
+# Delete, keeping the 10 newest, with 5 parallel jobs
+cf-pc -p awesome-android-root -k 10 -j 5
+
+# Print the installed version
+cf-pc --version
+
+# Show help
+cf-pc --help
 ```
 
-Flags:
+The project name is always required.
 
-- `-p, --project <name>` - Pages project name (default `awesome-android-root`)
-- `-j, --jobs <count>` - number of deletions to run concurrently (default `5`)
-- `--dry-run` - list what would be deleted without deleting
+## Flags
 
-The script keeps the 5 most recent deployments (plus the live production deployment). To change that, edit `KEEP` near the top of the script:
+| Flag | Description |
+|------|-------------|
+| `-p, --project <name>` | Pages project name (required) |
+| `-k, --keep <count>` | deployments to keep (default `5`; `0` deletes all but the live production deployment) |
+| `-j, --jobs <count>` | concurrent deletions (default `5`) |
+| `--dry-run` | list what would be deleted without deleting |
+| `--version` | print the version |
+| `-h, --help` | show help |
 
-```ts
-const KEEP = 5;
-```
+## Behavior notes
 
-## Notes
-
-- Output is colored when attached to a terminal; piped output (CI, logs) is plain. Set `NO_COLOR` to disable colors explicitly.
+- The newest N deployments are kept, plus the live production deployment, which is never deleted even if it falls outside the newest N.
 - Deletion uses `force=true`, so it also removes preview deployments with active aliases (e.g. branch URLs pointing at them).
-- The live production deployment is never deleted, even if it falls outside the newest N deployments.
 - The script paginates through all deployments before deciding what to delete, so it works regardless of how many exist.
+- Output is colored when attached to a terminal; piped output (CI, logs) is plain. Set `NO_COLOR` to disable colors explicitly.
 
 ## Troubleshooting
 
-- `Missing CF_API_TOKEN or CF_ACCOUNT_ID env vars` - the env vars aren't set in your current shell session.
-- `403` errors - token lacks Pages:Edit permission or wrong account ID.
-- `404` on list - check `PROJECT` name matches exactly what's in the Cloudflare dashboard.
+- `Missing CF_API_TOKEN or CF_ACCOUNT_ID env vars.` - the env vars aren't set in your current shell session.
+- `401` errors - the API token is invalid or expired.
+- `403` errors - the token lacks **Pages: Edit** permission or the Account ID is wrong.
+- `404` on list - check the `-p` project name matches exactly what's in the Cloudflare dashboard.
+
+## Publishing (maintainer)
+
+```bash
+npm pack --dry-run   # confirm the tarball contents
+npm publish          # needs npm login (2FA)
+```
+
+For future releases, bump `version` in `package.json` and run `npm publish` again.
