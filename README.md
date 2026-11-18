@@ -4,13 +4,13 @@ A collection of utility scripts used to maintain and automate parts of the [Awes
 
 ## Scripts
 
-### `cleanup`
-
-Removes old Cloudflare Pages deployments while retaining the most recent ones. Useful for keeping deployment history under control.
-
 ### `repo_freshness_checker`
 
 Checks GitHub repositories for update activity and generates Markdown or HTML reports with freshness metrics, health scores, and star counts. Supports both CLI and GUI usage.
+
+## Moved out
+
+- `cleanup` is now maintained as a standalone npm CLI in [fynks/cf-pc](https://github.com/fynks/cf-pc). Install it with `npm i -g cf-pc`.
 
 ## Requirements
 
