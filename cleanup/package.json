@@ -4,18 +4,19 @@
   "description": "Delete old Cloudflare Pages deployments, keeping the newest N",
   "type": "module",
   "bin": {
-    "cf-pc": "./cf-pages-cleanup.ts"
+    "cf-pc": "./dist/cf-pc.js"
   },
   "files": [
-    "cf-pages-cleanup.ts",
+    "dist/cf-pc.js",
     "README.md"
   ],
   "engines": {
     "node": ">=26"
   },
   "scripts": {
+    "build": "bun build ./cf-pages-cleanup.ts --target=node --outfile=dist/cf-pc.js",
     "test": "node --test test/cli.test.ts",
-    "prepublishOnly": "node cf-pages-cleanup.ts --help > /dev/null"
+    "prepack": "npm run build && node dist/cf-pc.js --help > /dev/null"
   },
   "repository": {
     "type": "git",

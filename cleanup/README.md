@@ -14,7 +14,7 @@ or, with Bun:
 bun add -g cf-pc
 ```
 
-Requires Node 26+ (for native TypeScript) or Bun.
+Requires Node 26+ or Bun. The published `cf-pc` command is compiled JavaScript, so installing needs no build tools or Bun; Bun is only needed to build from source.
 
 ## Credentials
 
