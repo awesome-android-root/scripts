@@ -63,8 +63,14 @@ test("negative keep is rejected", () => {
   assert.match(result.stderr, /Keep must be/);
 });
 
-test("non-integer jobs is rejected", () => {
+test("zero jobs is rejected", () => {
   const result = run(["-p", "demo", "--jobs=0"]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Jobs must be a positive integer/);
+});
+
+test("non-integer jobs is rejected", () => {
+  const result = run(["-p", "demo", "--jobs=abc"]);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Jobs must be a positive integer/);
 });

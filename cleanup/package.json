@@ -16,7 +16,8 @@
   "scripts": {
     "build": "bun build ./cf-pages-cleanup.ts --target=node --outfile=dist/cf-pc.js",
     "test": "node --test test/cli.test.ts",
-    "prepack": "npm run build && node dist/cf-pc.js --help > /dev/null"
+    "test:dist": "npm run build && node --test test/dist.test.ts",
+    "prepack": "npm run test:dist"
   },
   "repository": {
     "type": "git",

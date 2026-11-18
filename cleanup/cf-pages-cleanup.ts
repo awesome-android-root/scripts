@@ -134,11 +134,12 @@ if (!PROJECT) {
   process.exit(1);
 }
 
-const KEEP = Number(args.keep ?? 5);
-if (!Number.isInteger(KEEP) || KEEP < 0) {
+const keepArg = args.keep ?? "5";
+if (!/^\d+$/.test(keepArg)) {
   console.error("Keep must be a non-negative integer.");
   process.exit(1);
 }
+const KEEP = Number(keepArg);
 
 const JOBS = Number(args.jobs ?? DEFAULT_JOBS);
 const DRY_RUN = args["dry-run"] ?? false;
