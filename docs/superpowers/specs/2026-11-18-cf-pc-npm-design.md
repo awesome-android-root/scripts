@@ -77,7 +77,8 @@ cleanup/
 - `keywords`: cloudflare, pages, deployments, cleanup, cli.
 - `scripts.build`: `bun build ./cf-pages-cleanup.ts --target=node --outfile=dist/cf-pc.js`.
 - `scripts.prepack`: `npm run test:dist` — build, then the `dist/cf-pc.js`
-  tests (version, help, missing project, Node shebang). This runs on
+  tests (version, help, missing project, dry-run without project, Node
+  shebang). This runs on
   `npm pack` and `npm publish`, so a stale or broken artifact cannot be
   shipped.
 
