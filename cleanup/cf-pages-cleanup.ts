@@ -1,14 +1,12 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 // Deletes all Cloudflare Pages deployments for a project except the N most recent.
 // Requires: CF_API_TOKEN, CF_ACCOUNT_ID env vars.
-// Usage: bun cf-pages-cleanup.ts [-p project] [-j jobs] [--dry-run]
 
 import { parseArgs } from "node:util";
+import pkg from "./package.json" with { type: "json" };
 
-const KEEP = 5;
-const DEFAULT_PROJECT = "awesome-android-root";
 const DEFAULT_JOBS = 5;
-const USAGE = "Usage: bun cf-pages-cleanup.ts [-p project] [-j jobs] [-h] [--dry-run]";
+const USAGE = "Usage: cf-pc -p <project> [-k keep] [-j jobs] [-h] [--dry-run] [--version]";
 
 const COLORS = process.stdout.isTTY === true && !process.env.NO_COLOR;
 
@@ -96,9 +94,11 @@ function parseCli() {
   try {
     return parseArgs({
       options: {
-        project: { type: "string", short: "p", default: DEFAULT_PROJECT },
+        project: { type: "string", short: "p" },
+        keep: { type: "string", short: "k", default: "5" },
         jobs: { type: "string", short: "j", default: String(DEFAULT_JOBS) },
         "dry-run": { type: "boolean", default: false },
+        version: { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
       },
     }).values;
@@ -110,23 +110,38 @@ function parseCli() {
 }
 
 const args = parseCli();
-const PROJECT = args.project ?? DEFAULT_PROJECT;
-const JOBS = Number(args.jobs ?? DEFAULT_JOBS);
-const DRY_RUN = args["dry-run"] ?? false;
 
 if (args.help) {
   console.log(USAGE);
-  console.log("  -p, --project <name>   Pages project name");
-  console.log("  -j, --jobs <count>     concurrent deletions");
+  console.log("  -p, --project <name>   Pages project name (required)");
+  console.log("  -k, --keep <count>     deployments to keep (default 5)");
+  console.log("  -j, --jobs <count>     concurrent deletions (default 5)");
   console.log("      --dry-run          list what would be deleted");
+  console.log("      --version          print the version");
   console.log("  -h, --help             show this help");
   process.exit(0);
 }
 
-if (!PROJECT.trim()) {
-  console.error("Project name cannot be empty.");
+if (args.version) {
+  console.log(pkg.version);
+  process.exit(0);
+}
+
+const PROJECT = (args.project ?? "").trim();
+if (!PROJECT) {
+  console.error("Missing required option: -p, --project <name>");
+  console.error(USAGE);
   process.exit(1);
 }
+
+const KEEP = Number(args.keep ?? 5);
+if (!Number.isInteger(KEEP) || KEEP < 0) {
+  console.error("Keep must be a non-negative integer.");
+  process.exit(1);
+}
+
+const JOBS = Number(args.jobs ?? DEFAULT_JOBS);
+const DRY_RUN = args["dry-run"] ?? false;
 
 if (!Number.isInteger(JOBS) || JOBS < 1) {
   console.error("Jobs must be a positive integer.");
